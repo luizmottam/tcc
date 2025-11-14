@@ -17,79 +17,135 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { PlusCircle, HelpCircle } from "lucide-react";
-
 import { Asset } from "@/types/portfolio";
 
 interface AddAssetDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onAddAsset: (asset: {
-    ticker: string;
-    sector: string;
-    weight: number;
-    expectedReturn: number;
-    cvar: number;
-  }) => void;
+  onAddAsset: (asset: { ticker: string; sector: string; weight: number }) => void;
   asset?: Asset;
   onEditAsset?: (asset: Asset) => void;
+  currentPortfolioWeights: number[]; // pesos atuais do portfólio em decimal
 }
 
-export const AddAssetDialog = ({ open, onOpenChange, onAddAsset, asset, onEditAsset }: AddAssetDialogProps) => {
+interface FormData {
+  ticker: string;
+  sector: string;
+  weight: string; // string para input livre, convertimos depois
+}
+
+export const AddAssetDialog = ({
+  open,
+  onOpenChange,
+  onAddAsset,
+  asset,
+  onEditAsset,
+  currentPortfolioWeights = [],
+}: AddAssetDialogProps) => {
   const isEditMode = !!asset;
-  const [formData, setFormData] = useState({
+
+  const [formData, setFormData] = useState<FormData>({
     ticker: asset?.ticker || "",
     sector: asset?.sector || "",
-    weight: asset?.weight.toString() || "",
-    expectedReturn: asset?.expectedReturn.toString() || "",
-    cvar: asset?.cvar.toString() || "",
+    weight: asset?.weight?.toString() || "",
   });
 
-  // Update form when asset changes
+  // Estado para validação em tempo real
+  const [weightValidation, setWeightValidation] = useState<{
+    current: number;
+    withNew: number;
+    isValid: boolean;
+    isWarning: boolean;
+    message: string;
+  } | null>(null);
+
   useEffect(() => {
     if (asset) {
       setFormData({
         ticker: asset.ticker,
         sector: asset.sector,
-        weight: asset.weight.toString(),
-        expectedReturn: asset.expectedReturn.toString(),
-        cvar: asset.cvar.toString(),
+        weight: asset.weight?.toString() || "",
       });
     } else {
-      setFormData({
-        ticker: "",
-        sector: "",
-        weight: "",
-        expectedReturn: "",
-        cvar: "",
-      });
+      setFormData({ ticker: "", sector: "", weight: "" });
     }
-  }, [asset]);
+    setWeightValidation(null);
+  }, [asset, open]);
+
+  // Validar peso em tempo real
+  useEffect(() => {
+    const weightNum = Number(formData.weight);
+    if (isNaN(weightNum) || weightNum <= 0) {
+      setWeightValidation(null);
+      return;
+    }
+
+    // currentPortfolioWeights já vem em decimal (0-1)
+    let totalWeight = currentPortfolioWeights.reduce((acc, w) => acc + w, 0);
+    
+    if (isEditMode && asset?.weight !== undefined) {
+      // asset.weight está em porcentagem (0-100), converter para decimal
+      const oldWeightDecimal = asset.weight / 100;
+      totalWeight -= oldWeightDecimal;
+    }
+
+    const newWeightDecimal = weightNum / 100;
+    const totalWithNew = totalWeight + newWeightDecimal;
+    const totalWithNewPct = totalWithNew * 100;
+    
+    // Usar tolerância de 0.01% para comparações de ponto flutuante
+    const isValid = totalWithNew <= 1.0001;
+    const isWarning = totalWithNewPct >= 80 && totalWithNewPct <= 100.1;
+    
+    setWeightValidation({
+      current: totalWeight * 100,
+      withNew: totalWithNewPct,
+      isValid,
+      isWarning,
+      message: isValid 
+        ? `Peso total: ${totalWithNewPct.toFixed(2)}%`
+        : `Peso total excede 100%: ${totalWithNewPct.toFixed(2)}%`
+    });
+  }, [formData.weight, currentPortfolioWeights, isEditMode, asset]);
 
   const handleSubmit = () => {
-    if (
-      formData.ticker &&
-      formData.sector &&
-      formData.weight &&
-      formData.expectedReturn &&
-      formData.cvar
-    ) {
-      const assetData = {
-        ticker: formData.ticker.toUpperCase(),
-        sector: formData.sector,
-        weight: Number(formData.weight),
-        expectedReturn: Number(formData.expectedReturn),
-        cvar: Number(formData.cvar),
-      };
+    const weightNum = Number(formData.weight);
 
-      if (isEditMode && asset && onEditAsset) {
-        onEditAsset({ ...asset, ...assetData });
-      } else {
-        onAddAsset(assetData);
-      }
-      
-      setFormData({ ticker: "", sector: "", weight: "", expectedReturn: "", cvar: "" });
-      onOpenChange(false);
+    // Validação básica de campos
+    if (!formData.ticker.trim() || !formData.sector.trim() || isNaN(weightNum) || weightNum <= 0) {
+      alert("Preencha todos os campos corretamente. Peso deve ser maior que 0.");
+      return;
     }
+
+    // Validação de peso usando estado de validação
+    if (weightValidation && !weightValidation.isValid) {
+      alert(
+        `Não é possível ${isEditMode ? 'atualizar' : 'adicionar'} o ativo. ${weightValidation.message}`
+      );
+      return;
+    }
+
+    const assetData = {
+      ticker: formData.ticker.toUpperCase(),
+      sector: formData.sector,
+      weight: weightNum / 100, // converte % para decimal
+    };
+
+    // ==========================
+    // Chamada do backend
+    // ==========================
+    if (isEditMode && asset && onEditAsset) {
+      onEditAsset({ ...asset, ...assetData });
+    } else {
+      onAddAsset(assetData);
+    }
+
+    // Reset apenas no modo criação
+    if (!isEditMode) {
+      setFormData({ ticker: "", sector: "", weight: "" });
+    }
+
+    onOpenChange(false);
   };
 
   return (
@@ -102,13 +158,15 @@ export const AddAssetDialog = ({ open, onOpenChange, onAddAsset, asset, onEditAs
               {isEditMode ? "Editar Ativo" : "Adicionar Ativo"}
             </DialogTitle>
             <DialogDescription>
-              {isEditMode 
+              {isEditMode
                 ? "Atualize as informações do ativo"
                 : "Preencha as informações do ativo que deseja adicionar ao portfólio"}
             </DialogDescription>
           </DialogHeader>
+
           <div className="grid gap-4 py-4">
             <div className="grid grid-cols-2 gap-4">
+              {/* Ticker */}
               <div className="grid gap-2">
                 <div className="flex items-center gap-2">
                   <Label htmlFor="ticker">Ticker</Label>
@@ -117,7 +175,7 @@ export const AddAssetDialog = ({ open, onOpenChange, onAddAsset, asset, onEditAs
                       <HelpCircle className="w-4 h-4 text-muted-foreground cursor-help" />
                     </TooltipTrigger>
                     <TooltipContent>
-                      <p className="max-w-xs">Código de negociação do ativo na bolsa. Ex: PETR4, VALE3, ITUB4.</p>
+                      <p className="max-w-xs">Código do ativo. Ex: PETR4, VALE3, ITUB4.</p>
                     </TooltipContent>
                   </Tooltip>
                 </div>
@@ -128,6 +186,8 @@ export const AddAssetDialog = ({ open, onOpenChange, onAddAsset, asset, onEditAs
                   onChange={(e) => setFormData({ ...formData, ticker: e.target.value })}
                 />
               </div>
+
+              {/* Setor */}
               <div className="grid gap-2">
                 <div className="flex items-center gap-2">
                   <Label htmlFor="sector">Setor</Label>
@@ -136,7 +196,7 @@ export const AddAssetDialog = ({ open, onOpenChange, onAddAsset, asset, onEditAs
                       <HelpCircle className="w-4 h-4 text-muted-foreground cursor-help" />
                     </TooltipTrigger>
                     <TooltipContent>
-                      <p className="max-w-xs">Categoria ou indústria do ativo. Ex: Energia, Bancos, Mineração.</p>
+                      <p className="max-w-xs">Indústria do ativo. Ex: Energia, Bancos, Mineração.</p>
                     </TooltipContent>
                   </Tooltip>
                 </div>
@@ -148,7 +208,8 @@ export const AddAssetDialog = ({ open, onOpenChange, onAddAsset, asset, onEditAs
                 />
               </div>
             </div>
-            <div className="grid grid-cols-3 gap-4">
+
+            {/* Peso */}
               <div className="grid gap-2">
                 <div className="flex items-center gap-2">
                   <Label htmlFor="weight">Peso (%)</Label>
@@ -157,67 +218,49 @@ export const AddAssetDialog = ({ open, onOpenChange, onAddAsset, asset, onEditAs
                       <HelpCircle className="w-4 h-4 text-muted-foreground cursor-help" />
                     </TooltipTrigger>
                     <TooltipContent>
-                      <p className="max-w-xs">Proporção do ativo no portfólio. A soma total deve ser 100%.</p>
+                      <p className="max-w-xs">Proporção do portfólio destinada ao ativo. Deve ser maior que 0 e não exceder 100% cumulativo.</p>
                     </TooltipContent>
                   </Tooltip>
                 </div>
                 <Input
                   id="weight"
                   type="number"
+                step="0.01"
+                min="0.01"
+                max="100"
                   placeholder="25"
                   value={formData.weight}
                   onChange={(e) => setFormData({ ...formData, weight: e.target.value })}
-                />
+                className={weightValidation && !weightValidation.isValid ? "border-destructive" : ""}
+              />
+              {weightValidation && (
+                <div className={`text-xs mt-1 ${
+                  !weightValidation.isValid ? "text-destructive font-semibold" :
+                  weightValidation.isWarning ? "text-warning" :
+                  "text-muted-foreground"
+                }`}>
+                  {weightValidation.isValid ? (
+                    <>
+                      {weightValidation.message}
+                      {weightValidation.isWarning && " ⚠️ Próximo do limite"}
+                    </>
+                  ) : (
+                    <>❌ {weightValidation.message}</>
+                  )}
               </div>
-              <div className="grid gap-2">
-                <div className="flex items-center gap-2">
-                  <Label htmlFor="return">Retorno (%)</Label>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <HelpCircle className="w-4 h-4 text-muted-foreground cursor-help" />
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      <p className="max-w-xs">Retorno médio esperado do ativo em determinado período.</p>
-                    </TooltipContent>
-                  </Tooltip>
-                </div>
-                <Input
-                  id="return"
-                  type="number"
-                  step="0.1"
-                  placeholder="15.5"
-                  value={formData.expectedReturn}
-                  onChange={(e) => setFormData({ ...formData, expectedReturn: e.target.value })}
-                />
-              </div>
-              <div className="grid gap-2">
-                <div className="flex items-center gap-2">
-                  <Label htmlFor="cvar">CVaR (%)</Label>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <HelpCircle className="w-4 h-4 text-muted-foreground cursor-help" />
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      <p className="max-w-xs">Conditional Value at Risk — representa a perda média esperada nos piores 5% dos cenários.</p>
-                    </TooltipContent>
-                  </Tooltip>
-                </div>
-                <Input
-                  id="cvar"
-                  type="number"
-                  step="0.1"
-                  placeholder="8.2"
-                  value={formData.cvar}
-                  onChange={(e) => setFormData({ ...formData, cvar: e.target.value })}
-                />
-              </div>
+              )}
             </div>
           </div>
+
           <DialogFooter>
             <Button variant="outline" onClick={() => onOpenChange(false)}>
               Cancelar
             </Button>
-            <Button onClick={handleSubmit}>
+            <Button 
+              onClick={handleSubmit}
+              disabled={!formData.ticker.trim() || !formData.sector.trim() || !formData.weight || 
+                       (weightValidation && !weightValidation.isValid)}
+            >
               {isEditMode ? "Salvar Alterações" : "Adicionar Ativo"}
             </Button>
           </DialogFooter>

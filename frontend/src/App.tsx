@@ -5,8 +5,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import Dashboard from "./pages/Dashboard";
 import PortfolioDetails from "./pages/PortfolioDetails";
-import PortfolioAnalysis from "./pages/PortfolioAnalysis";
 import PortfolioOptimization from "./pages/PortfolioOptimization";
+import PortfolioAnalytics from "./pages/PortfolioAnalytics";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -20,8 +20,8 @@ const App = () => (
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/portfolio/:id" element={<PortfolioDetails />} />
-          <Route path="/portfolio/:id/analysis" element={<PortfolioAnalysis />} />
           <Route path="/portfolio/:id/optimization" element={<PortfolioOptimization />} />
+          <Route path="/portfolio/:id/analytics" element={<PortfolioAnalytics />} />
           {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
           <Route path="*" element={<NotFound />} />
         </Routes>

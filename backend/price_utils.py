@@ -96,20 +96,25 @@ def compute_metrics(df_prices: pd.DataFrame, alpha: float = 0.95, trading_days: 
     if df_prices is None or df_prices.empty:
         return results
 
-    returns = df_prices.pct_change().dropna()
-    if returns.empty:
+    # Retorno logarítmico: log(P_t / P_{t-1})
+    import numpy as np
+    log_returns = np.log(df_prices / df_prices.shift(1)).dropna()
+    if log_returns.empty:
         return results
 
-    for col in returns.columns:
-        r = returns[col].dropna()
-        if r.empty:
+    for col in log_returns.columns:
+        r_log = log_returns[col].dropna()
+        if r_log.empty:
             results[col] = {"expectedReturn": None, "cvar": None}
             continue
 
-        # Retorno anualizado
-        mean_daily = r.mean()
-        ann_return = (1.0 + mean_daily) ** trading_days - 1.0
+        # Retorno anualizado a partir de retornos logarítmicos
+        mean_log_daily = r_log.mean()
+        ann_return = np.exp(mean_log_daily * trading_days) - 1.0
         expected_return_pct = float(ann_return * 100)
+        
+        # Converter para retorno simples para cálculo de CVaR
+        r = np.exp(r_log) - 1
 
         # CVaR diário → anualizado
         try:

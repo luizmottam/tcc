@@ -5,6 +5,7 @@ export interface Asset {
   weight: number;
   expectedReturn: number;
   cvar: number;
+  currentPrice?: number;
 }
 
 export interface Portfolio {

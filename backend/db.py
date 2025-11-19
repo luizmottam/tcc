@@ -148,6 +148,36 @@ def create_database_and_tables():
         )
     """)
 
+    # ------------- CACHE DE DADOS HISTÓRICOS -------------
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS historico (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            data DATE NOT NULL,
+            ticker VARCHAR(20) NOT NULL,
+            adjclose DOUBLE,
+            UNIQUE KEY uniq_data_ticker (data, ticker)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS preco_atual (
+            ticker VARCHAR(20) PRIMARY KEY,
+            timestamp DATETIME,
+            price DOUBLE
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS retornos (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            data DATE NOT NULL,
+            ticker VARCHAR(20) NOT NULL,
+            retorno DOUBLE,
+            retorno_acumulado DOUBLE,
+            UNIQUE KEY uniq_data_ticker (data, ticker)
+        )
+    """)
+
     # ---------- Usuário padrão ----------
     cursor.execute("""
         INSERT IGNORE INTO users (id, username, email)

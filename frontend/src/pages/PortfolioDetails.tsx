@@ -4,6 +4,7 @@ import { useParams, useNavigate } from "react-router-dom";
 import { Portfolio, Asset } from "@/types/portfolio";
 
 import { AddAssetDialog } from "@/components/AddAssetDialog";
+import { RiskContributionCard } from "@/components/RiskContributionCard";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
@@ -56,6 +57,7 @@ const PortfolioDetails = () => {
             weight: Number(a.weight || 0),  // Já vem em percentual (0-100) do backend
             expectedReturn: Number(a.expectedReturn ?? 0),
             cvar: Number(a.cvar ?? 0),
+            currentPrice: a.currentPrice ?? undefined,
           })),
           totalReturn: data.totalReturn ?? 0,
           totalRisk: data.totalRisk ?? 0,
@@ -325,17 +327,19 @@ const PortfolioDetails = () => {
             <div className="overflow-x-auto">
               <table className="w-full table-fixed">
                 <colgroup>
-                  <col className="w-[20%]" />
-                  <col className="w-[20%]" />
                   <col className="w-[15%]" />
                   <col className="w-[15%]" />
-                  <col className="w-[15%]" />
-                  <col className="w-[15%]" />
+                  <col className="w-[12%]" />
+                  <col className="w-[12%]" />
+                  <col className="w-[12%]" />
+                  <col className="w-[12%]" />
+                  <col className="w-[10%]" />
                 </colgroup>
                 <thead>
                   <tr className="border-b border-border">
                     <th className="text-left py-3 px-4 font-semibold text-sm">Ticker</th>
                     <th className="text-left py-3 px-4 font-semibold text-sm">Setor</th>
+                    <th className="text-right py-3 px-4 font-semibold text-sm">Preço</th>
                     <th className="text-right py-3 px-4 font-semibold text-sm">Peso</th>
                     <th className="text-right py-3 px-4 font-semibold text-sm">Retorno</th>
                     <th className="text-right py-3 px-4 font-semibold text-sm">CVaR</th>
@@ -360,6 +364,15 @@ const PortfolioDetails = () => {
                       </td>
                       <td className="py-3 px-4 text-muted-foreground align-middle truncate">
                         {asset.sector || "-"}
+                      </td>
+                      <td className="py-3 px-4 text-right align-middle">
+                        <span className="inline-flex items-center gap-1 font-semibold whitespace-nowrap">
+                          {asset.currentPrice ? (
+                            <>R$ {asset.currentPrice.toFixed(2)}</>
+                          ) : (
+                            <span className="text-muted-foreground text-sm">-</span>
+                          )}
+                        </span>
                       </td>
                       <td className="py-3 px-4 text-right align-middle">
                         <span className="inline-flex items-center gap-1 font-semibold whitespace-nowrap">
@@ -406,6 +419,11 @@ const PortfolioDetails = () => {
             </div>
           )}
         </Card>
+
+        {/* Contribuição de Risco */}
+        {portfolio.assets.length > 0 && (
+          <RiskContributionCard portfolioId={id || ""} />
+        )}
 
         {/* Action Buttons */}
         {portfolio.assets.length > 0 && (

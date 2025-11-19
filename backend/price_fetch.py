@@ -71,29 +71,94 @@ def get_adjclose(symbol: str, start_date: str, end_date: str) -> Optional[pd.Dat
         return None
 
 
-def get_price_history(tickers: List[str], period: str = "5y") -> pd.DataFrame:
+def get_price_history(tickers: List[str], period: str = "5y", start_date: str = None, end_date: str = None) -> pd.DataFrame:
     """
-    Busca histórico de preços ajustados do Yahoo Finance usando requests paralelos.
+    Busca histórico de preços: primeiro do banco, se não encontrar, busca da web.
     Retorna DataFrame (dias × tickers) com preços de fechamento.
-    Muito mais rápido que yfinance!
+    
+    Args:
+        tickers: Lista de tickers
+        period: Período padrão ("1y", "2y", "4y", "5y", "10y") ou None se usar start_date/end_date
+        start_date: Data inicial no formato "YYYY-MM-DD" (opcional, sobrescreve period)
+        end_date: Data final no formato "YYYY-MM-DD" (opcional, padrão: hoje)
     """
     if not tickers:
         raise ValueError("Nenhum ticker informado")
     
     normalized = [normalize_ticker(t) for t in tickers]
     
-    # Calcular datas baseado no período
-    end_date = datetime.datetime.now()
+    # Se datas específicas foram fornecidas, usar elas
+    if start_date and end_date:
+        try:
+            from price_cache import get_price_history_from_db, save_price_history_to_db
+            # get_adjclose já está importado no topo do arquivo
+            
+            start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+            end_dt = datetime.datetime.strptime(end_date, "%Y-%m-%d")
+            
+            # Tentar buscar do banco
+            df_from_db = get_price_history_from_db(normalized, start_date, end_date)
+            if df_from_db is not None and len(df_from_db.columns) == len(normalized):
+                missing_tickers = set(normalized) - set(df_from_db.columns)
+                if not missing_tickers:
+                    return df_from_db
+            
+            # Se não encontrou no banco, buscar da web
+            dfs = []
+            with ThreadPoolExecutor(max_workers=min(len(normalized), 10)) as executor:
+                future_to_ticker = {
+                    executor.submit(get_adjclose, ticker, start_date, end_date): ticker 
+                    for ticker in normalized
+                }
+                
+                for future in as_completed(future_to_ticker):
+                    ticker = future_to_ticker[future]
+                    try:
+                        df = future.result()
+                        if df is not None and not df.empty:
+                            dfs.append(df)
+                    except Exception as e:
+                        print(f"[PRICE_FETCH] ✗ Erro ao buscar {ticker}: {e}")
+            
+            if not dfs:
+                raise Exception(f"Nenhum histórico encontrado para {normalized}")
+            
+            df_final = pd.concat(dfs, axis=1).sort_index()
+            df_final = df_final.dropna(how='all')
+            
+            # Salvar no banco
+            try:
+                save_price_history_to_db(normalized, df_final)
+            except:
+                pass
+            
+            return df_final
+        except Exception as e:
+            print(f"[PRICE_FETCH] Erro ao buscar com datas específicas: {e}")
+            # Continuar com o fluxo normal
+    
+    # Tentar usar cache primeiro (método padrão)
+    try:
+        from price_cache import get_or_fetch_price_history
+        return get_or_fetch_price_history(normalized, period)
+    except ImportError:
+        # Fallback: buscar direto da web (comportamento antigo)
+        print("[PRICE_FETCH] Cache não disponível, buscando da web...")
+        pass
+    
+    # Código de fallback (buscar direto da web)
+    end_date_obj = datetime.datetime.now()
     period_days = {
         "1y": 365,
         "2y": 730,
+        "4y": 1460,
         "5y": 1825,
         "10y": 3650
     }.get(period, 730)
-    start_date = end_date - datetime.timedelta(days=period_days)
+    start_date_obj = end_date_obj - datetime.timedelta(days=period_days)
     
-    start_str = start_date.strftime("%Y-%m-%d")
-    end_str = end_date.strftime("%Y-%m-%d")
+    start_str = start_date_obj.strftime("%Y-%m-%d")
+    end_str = end_date_obj.strftime("%Y-%m-%d")
     
     # Buscar preços em paralelo
     print(f"[PRICE_FETCH] Iniciando busca de preços para {len(normalized)} tickers: {normalized}")
@@ -138,12 +203,19 @@ def get_price_history(tickers: List[str], period: str = "5y") -> pd.DataFrame:
 # Matriz de Retornos
 # ============================================================
 
-def get_returns_matrix(tickers: List[str], period: str = "5y") -> np.ndarray:
+def get_returns_matrix(tickers: List[str], period: str = "5y", start_date: str = None, end_date: str = None) -> np.ndarray:
     """
-    Retorna matriz (dias × ativos) de retornos diários em float64.
+    Retorna matriz (dias × ativos) de retornos logarítmicos diários em float64.
+    
+    Args:
+        tickers: Lista de tickers
+        period: Período padrão ou None se usar start_date/end_date
+        start_date: Data inicial no formato "YYYY-MM-DD" (opcional)
+        end_date: Data final no formato "YYYY-MM-DD" (opcional)
     """
-    price_df = get_price_history(tickers, period)
-    returns = price_df.pct_change().dropna().astype(np.float64)
+    price_df = get_price_history(tickers, period, start_date, end_date)
+    # Retorno logarítmico: log(P_t / P_{t-1})
+    returns = np.log(price_df / price_df.shift(1)).dropna().astype(np.float64)
     return returns.values
 
 
@@ -157,7 +229,7 @@ def get_performance_series(
     period: str = "5y"
 ) -> pd.DataFrame:
     """
-    Calcula série temporal de retorno cumulativo da carteira (%).
+    Calcula série temporal de retorno cumulativo da carteira usando retornos logarítmicos (%).
     """
     weights = np.array(weights, dtype=float)
     if weights.sum() <= 0:
@@ -165,10 +237,14 @@ def get_performance_series(
     weights = weights / weights.sum()
 
     price_df = get_price_history(tickers, period)
-    daily_returns = price_df.pct_change().dropna()
+    # Retorno logarítmico: log(P_t / P_{t-1})
+    log_returns = np.log(price_df / price_df.shift(1)).dropna()
 
-    portfolio_daily_returns = (daily_returns * weights).sum(axis=1)
-    cumulative_return = (1 + portfolio_daily_returns).cumprod() - 1
+    # Retorno logarítmico do portfólio: soma ponderada dos retornos logarítmicos
+    portfolio_log_returns = (log_returns * weights).sum(axis=1)
+    
+    # Retorno acumulado: exp(soma dos retornos logarítmicos) - 1
+    cumulative_return = np.exp(portfolio_log_returns.cumsum()) - 1
 
     df = pd.DataFrame({
         "date": cumulative_return.index.strftime("%Y-%m-%d"),
@@ -201,29 +277,35 @@ def compute_asset_metrics(
 
     try:
         price_df = get_price_history(tickers, period)
-        daily_returns = price_df.pct_change().dropna()
+        # Retorno logarítmico: log(P_t / P_{t-1})
+        log_returns = np.log(price_df / price_df.shift(1)).dropna()
 
-        for ticker in daily_returns.columns:
-            r = daily_returns[ticker].values
+        for ticker in log_returns.columns:
+            r_log = log_returns[ticker].values
 
-            # Retorno anualizado (geométrico)
-            mean_daily = r.mean()
-            annual_return = ((1 + mean_daily) ** 252 - 1) * 100
+            # Retorno anualizado a partir de retornos logarítmicos
+            # Média dos retornos logarítmicos * 252 dias
+            mean_log_daily = r_log.mean()
+            annual_return = (np.exp(mean_log_daily * 252) - 1) * 100
 
-            # CVaR
+            # CVaR - converter retorno logarítmico para retorno simples para cálculo de CVaR
+            # CVaR é calculado sobre perdas, então convertemos log returns para simple returns
+            r_simple = np.exp(r_log) - 1
+            
             if use_bootstrap:
-                n_days = len(r)
+                n_days = len(r_simple)
                 annual_returns_sim = np.empty(n_sim)
                 for i in range(n_sim):
                     idx = rng.integers(0, n_days, size=block)
-                    sample = r[idx]
+                    sample = r_simple[idx]
+                    # Retorno acumulado anual: produto dos (1 + retorno)
                     annual_returns_sim[i] = np.prod(1 + sample) - 1
                 var_thresh = np.percentile(annual_returns_sim, (1 - alpha) * 100)
                 tail = annual_returns_sim[annual_returns_sim <= var_thresh]
                 cvar_annual = -np.mean(tail) * 100
             else:
-                var_thresh = np.percentile(r, (1 - alpha) * 100)
-                tail = r[r <= var_thresh]
+                var_thresh = np.percentile(r_simple, (1 - alpha) * 100)
+                tail = r_simple[r_simple <= var_thresh]
                 cvar_daily = tail.mean() if len(tail) > 0 else var_thresh
                 cvar_annual = abs(cvar_daily * np.sqrt(252)) * 100
 
@@ -286,9 +368,9 @@ def get_ibovespa_series(period: str = "2y") -> pd.DataFrame:
         
         df = get_adjclose("^BVSP", start_str, end_str)
         if df is not None and not df.empty:
-            # Calcular retorno cumulativo
-            daily_returns = df.iloc[:, 0].pct_change().dropna()
-            cumulative = (1 + daily_returns).cumprod() - 1
+            # Calcular retorno cumulativo usando retorno logarítmico
+            log_returns = np.log(df.iloc[:, 0] / df.iloc[:, 0].shift(1)).dropna()
+            cumulative = np.exp(log_returns.cumsum()) - 1
             
             result_df = pd.DataFrame({
                 'date': cumulative.index.strftime("%Y-%m-%d"),
@@ -339,14 +421,18 @@ def calculate_portfolio_metrics(
     """
     try:
         price_df = get_price_history(tickers, period)
-        daily_returns = price_df.pct_change().dropna()
+        # Retorno logarítmico: log(P_t / P_{t-1})
+        log_returns = np.log(price_df / price_df.shift(1)).dropna()
         
-        # Retorno do portfólio diário
-        portfolio_returns = (daily_returns * weights).sum(axis=1)
+        # Retorno logarítmico do portfólio: soma ponderada dos retornos logarítmicos
+        portfolio_log_returns = (log_returns * weights).sum(axis=1)
         
-        # Retorno médio anualizado
-        mean_daily = portfolio_returns.mean()
-        annual_return = ((1 + mean_daily) ** 252 - 1) * 100
+        # Retorno médio anualizado a partir de retornos logarítmicos
+        mean_log_daily = portfolio_log_returns.mean()
+        annual_return = (np.exp(mean_log_daily * 252) - 1) * 100
+        
+        # Converter para retorno simples para cálculos de volatilidade e CVaR
+        portfolio_returns = np.exp(portfolio_log_returns) - 1
         
         # Desvio padrão anualizado (volatilidade)
         std_daily = portfolio_returns.std()
@@ -390,13 +476,18 @@ def get_performance_series(
     try:
         # Preços do portfólio
         price_df = get_price_history(tickers, period)
-        daily_returns = price_df.pct_change().dropna()
-        portfolio_daily_returns = (daily_returns * weights).sum(axis=1)
-        portfolio_cumulative = (1 + portfolio_daily_returns).cumprod() - 1
+        # Retorno logarítmico: log(P_t / P_{t-1})
+        log_returns = np.log(price_df / price_df.shift(1)).dropna()
+        
+        # Retorno logarítmico do portfólio: soma ponderada dos retornos logarítmicos
+        portfolio_log_returns = (log_returns * weights).sum(axis=1)
+        
+        # Retorno acumulado: exp(soma dos retornos logarítmicos) - 1
+        portfolio_cumulative = np.exp(portfolio_log_returns.cumsum()) - 1
         
         # Preços do Ibovespa
         ibov_df = get_ibovespa_series(period)
-        dates = portfolio_daily_returns.index
+        dates = portfolio_log_returns.index
         
         # Taxa Selic (aproximação - pode ser melhorada com API do BCB)
         # Assumindo Selic constante de 11.75% ao ano
@@ -502,6 +593,8 @@ def calculate_portfolio_metrics(returns: np.ndarray, weights: np.ndarray,
         }
     """
     # Retorno anual
+    # Assumindo que returns são retornos simples (não logarítmicos)
+    # Para retornos simples: média aritmética
     mean_daily = np.mean(returns)
     annual_return = ((1 + mean_daily) ** 252 - 1) * 100
     

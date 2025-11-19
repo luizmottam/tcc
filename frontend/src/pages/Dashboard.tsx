@@ -5,7 +5,7 @@ import { PortfolioCard } from "@/components/PortfolioCard";
 import { CreatePortfolioDialog } from "@/components/CreatePortfolioDialog";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { Plus, TrendingUp } from "lucide-react";
+import { Plus, TrendingUp, RefreshCw } from "lucide-react";
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from "recharts";
 import { toast } from "sonner";
 
@@ -17,6 +17,7 @@ const Dashboard = () => {
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false);
   const [editingPortfolio, setEditingPortfolio] = useState<Portfolio | null>(null);
   const [comparisonData, setComparisonData] = useState<Array<{ date: string; portfolios: number; ibovespa: number }>>([]);
+  const [updatingPrices, setUpdatingPrices] = useState(false);
   const [loadingComparison, setLoadingComparison] = useState(false);
   const navigate = useNavigate();
 
@@ -39,6 +40,7 @@ const Dashboard = () => {
           weight: Number(a.weight ?? a.peso ?? 0),
           expectedReturn: a.expectedReturn ?? 0,
           cvar: a.cvar ?? 0,
+          currentPrice: a.currentPrice ?? undefined,
         })),
         totalReturn: p.totalReturn ?? 0,
         totalRisk: p.totalRisk ?? 0,
@@ -174,6 +176,27 @@ const Dashboard = () => {
     if (!open) setEditingPortfolio(null);
   };
 
+  /** Atualizar preços atuais */
+  const handleUpdatePrices = async () => {
+    setUpdatingPrices(true);
+    try {
+      const res = await fetch(`${API_BASE}/prices/update`, { method: "POST" });
+      if (!res.ok) throw new Error("Falha ao atualizar preços");
+      
+      toast.success("Atualização de preços iniciada. Os valores serão atualizados em breve.");
+      
+      // Aguardar alguns segundos e recarregar portfólios
+      setTimeout(() => {
+        loadPortfolios();
+        setUpdatingPrices(false);
+      }, 3000);
+    } catch (err) {
+      console.error(err);
+      toast.error("Erro ao atualizar preços");
+      setUpdatingPrices(false);
+    }
+  };
+
   // Retorno médio e risco médio
   const averageReturn =
     portfolios.length > 0
@@ -194,12 +217,22 @@ const Dashboard = () => {
             <div className="p-3 bg-primary rounded-xl shadow-elegant">
               <TrendingUp className="w-6 h-6 text-primary-foreground" />
             </div>
-            <div>
+            <div className="flex-1">
               <h1 className="text-3xl font-bold">Meus Portfólios</h1>
               <p className="text-muted-foreground">
                 Gerencie e otimize seus investimentos com Algoritmo Genético
               </p>
             </div>
+            <Button
+              onClick={handleUpdatePrices}
+              disabled={updatingPrices}
+              variant="outline"
+              size="sm"
+              className="gap-2"
+            >
+              <RefreshCw className={`w-4 h-4 ${updatingPrices ? 'animate-spin' : ''}`} />
+              Atualizar Preços
+            </Button>
           </div>
         </div>
 

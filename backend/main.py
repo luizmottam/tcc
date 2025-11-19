@@ -15,7 +15,11 @@ from price_fetch import (
     get_sector_from_ticker,
     calculate_portfolio_metrics,
     get_performance_series,
+    get_current_price,
 )
+from procidure import upsert_current_price, get_conn as get_proc_conn, get_current_price_from_db
+from risk_contribution import calculate_cvar_risk_contribution, calculate_cvar_contribution_detailed
+from backtesting import calculate_backtest_performance, get_backtest_series
 from ga import run_ga  # algoritmo genético single-objective
 from nsga2 import run_nsga2  # NSGA-II multi-objective
 import mysql.connector
@@ -33,6 +37,7 @@ class AssetOut(BaseModel):
     weight: float  # em %
     expectedReturn: Optional[float] = None
     cvar: Optional[float] = None
+    currentPrice: Optional[float] = None
 
 class PortfolioOut(BaseModel):
     id: str
@@ -56,6 +61,15 @@ class OptimizationResultOut(BaseModel):
 # -------------------------
 app = FastAPI(title="API Refatorada - Portfólios GA + CVaR")
 db.create_database_and_tables()
+
+# Criar tabelas do procedure se necessário
+try:
+    from procidure import create_tables as create_procedure_tables
+    create_procedure_tables()
+    print("[INIT] Tabelas de cache criadas/verificadas")
+except Exception as e:
+    print(f"[INIT] Aviso ao criar tabelas de cache: {e}")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -66,6 +80,65 @@ app.add_middleware(
 # Armazenamento de progresso de otimização (em memória)
 optimization_progress = {}
 progress_lock = threading.Lock()
+
+
+# -------------------------
+# INICIALIZAÇÃO: SINCRONIZAR TICKERS DO BANCO
+# -------------------------
+def sync_all_tickers_on_startup():
+    """
+    Verifica todos os tickers existentes nos portfólios e sincroniza
+    no banco de dados se necessário.
+    """
+    try:
+        print("[INIT] Verificando tickers dos portfólios...")
+        conn = get_db_conn()
+        cur = conn.cursor(dictionary=True)
+        
+        # Buscar todos os tickers únicos dos portfólios
+        cur.execute("""
+            SELECT DISTINCT a.ticker
+            FROM ativos a
+            JOIN portfolio_ativos pa ON pa.ativo_id = a.id
+        """)
+        tickers_in_portfolios = [row['ticker'] for row in cur.fetchall()]
+        
+        # Buscar tickers que já existem no banco de histórico
+        cur.execute("SELECT DISTINCT ticker FROM historico")
+        tickers_in_db = [row['ticker'] for row in cur.fetchall()]
+        
+        cur.close()
+        conn.close()
+        
+        # Normalizar tickers para formato Yahoo
+        normalized_tickers = [normalize_ticker(t) for t in tickers_in_portfolios]
+        
+        # Encontrar tickers que não estão no banco
+        missing_tickers = [t for t in normalized_tickers if t not in tickers_in_db]
+        
+        if missing_tickers:
+            print(f"[INIT] {len(missing_tickers)} tickers não encontrados no banco: {missing_tickers}")
+            print("[INIT] Sincronizando tickers no banco...")
+            
+            try:
+                from price_cache import sync_tickers_to_db
+                sync_tickers_to_db(missing_tickers, period="5y")
+                print(f"[INIT] ✓ Sincronização concluída para {len(missing_tickers)} tickers")
+            except Exception as e:
+                print(f"[INIT] ✗ Erro ao sincronizar: {e}")
+        else:
+            print(f"[INIT] ✓ Todos os {len(normalized_tickers)} tickers já estão no banco")
+            
+    except Exception as e:
+        print(f"[INIT] ⚠ Erro ao verificar tickers: {e}")
+
+
+# Executar sincronização na inicialização (em background)
+@app.on_event("startup")  # type: ignore
+async def startup_event():
+    """Executa tarefas na inicialização do servidor"""
+    # Executar em thread separada para não bloquear o startup
+    threading.Thread(target=sync_all_tickers_on_startup, daemon=True).start()
 
 # -------------------------
 # FUNÇÕES AUXILIARES
@@ -180,7 +253,8 @@ def list_portfolios():
                     "sector": a.get("setor"),
                     "weight": float(a.get("peso") or 0) * 100,
                     "expectedReturn": None,
-                    "cvar": None
+                    "cvar": None,
+                    "currentPrice": None
                 })
             # calcular métricas
             tickers = [normalize_ticker(a["ticker"]) for a in assets]
@@ -194,11 +268,19 @@ def list_portfolios():
             except:
                 pass
             
-            # Calcular retorno e risco do portfólio corretamente
-            # Retorno: média ponderada simples (correto)
-            totalReturn = sum((a["expectedReturn"] or 0) * (a["weight"]/100) for a in assets)
+            # Buscar preços atuais do banco (primeiro do dia atual, senão o último disponível)
+            try:
+                for a in assets:
+                    normalized_ticker = normalize_ticker(a["ticker"])
+                    current_price = get_current_price_from_db(normalized_ticker)
+                    if current_price is not None:
+                        a["currentPrice"] = current_price
+            except Exception as e:
+                print(f"[AVISO] Erro ao buscar preços atuais: {e}")
+                pass
             
-            # Risco: usar cálculo correto do portfólio considerando correlação
+            # Calcular retorno e risco do portfólio corretamente usando log returns e correlação
+            totalReturn = None
             totalRisk = None
             assets_with_weight = [a for a in assets if a["weight"] > 0]
             if len(tickers) > 0 and len(assets_with_weight) > 0:
@@ -219,14 +301,19 @@ def list_portfolios():
                         if total_weight_sum > 0:
                             weights_array = weights_array / total_weight_sum
                             
-                            # Calcular métricas do portfólio usando função correta
+                            # Calcular métricas do portfólio usando função correta (log returns + correlação)
                             portfolio_metrics = calculate_portfolio_metrics(filtered_tickers, weights_array, period="1y")
+                            totalReturn = portfolio_metrics.get("retorno_medio", 0.0)
                             totalRisk = portfolio_metrics.get("cvar", 0.0)
                 except Exception as e:
-                    print(f"[AVISO] Erro ao calcular risco do portfólio: {e}")
+                    print(f"[AVISO] Erro ao calcular métricas do portfólio: {e}")
                     # Fallback: média ponderada simples (menos preciso)
+                    totalReturn = sum((a["expectedReturn"] or 0) * (a["weight"]/100) for a in assets)
                     totalRisk = sum((a["cvar"] or 0) * (a["weight"]/100) for a in assets)
             
+            # Fallback final se não conseguiu calcular
+            if totalReturn is None:
+                totalReturn = sum((a["expectedReturn"] or 0) * (a["weight"]/100) for a in assets)
             if totalRisk is None:
                 totalRisk = sum((a["cvar"] or 0) * (a["weight"]/100) for a in assets)
             portfolios.append({
@@ -267,7 +354,8 @@ def get_portfolio(portfolio_id: int):
                 "sector": a.get("setor"),
                 "weight": float(a.get("peso") or 0) * 100,
                 "expectedReturn": None,
-                "cvar": None
+                "cvar": None,
+                "currentPrice": None
             })
         tickers = [normalize_ticker(a["ticker"]) for a in assets]
         try:
@@ -280,11 +368,19 @@ def get_portfolio(portfolio_id: int):
         except:
             pass
         
-        # Calcular retorno e risco do portfólio corretamente
-        # Retorno: média ponderada simples (correto)
-        totalReturn = sum((a["expectedReturn"] or 0) * (a["weight"]/100) for a in assets)
+        # Buscar preços atuais do banco (primeiro do dia atual, senão o último disponível)
+        try:
+            for a in assets:
+                normalized_ticker = normalize_ticker(a["ticker"])
+                current_price = get_current_price_from_db(normalized_ticker)
+                if current_price is not None:
+                    a["currentPrice"] = current_price
+        except Exception as e:
+            print(f"[AVISO] Erro ao buscar preços atuais: {e}")
+            pass
         
-        # Risco: usar cálculo correto do portfólio considerando correlação
+        # Calcular retorno e risco do portfólio corretamente usando log returns e correlação
+        totalReturn = None
         totalRisk = None
         assets_with_weight = [a for a in assets if a["weight"] > 0]
         if len(tickers) > 0 and len(assets_with_weight) > 0:
@@ -305,14 +401,19 @@ def get_portfolio(portfolio_id: int):
                     if total_weight_sum > 0:
                         weights_array = weights_array / total_weight_sum
                         
-                        # Calcular métricas do portfólio usando função correta
+                        # Calcular métricas do portfólio usando função correta (log returns + correlação)
                         portfolio_metrics = calculate_portfolio_metrics(filtered_tickers, weights_array, period="1y")
+                        totalReturn = portfolio_metrics.get("retorno_medio", 0.0)
                         totalRisk = portfolio_metrics.get("cvar", 0.0)
             except Exception as e:
-                print(f"[AVISO] Erro ao calcular risco do portfólio: {e}")
+                print(f"[AVISO] Erro ao calcular métricas do portfólio: {e}")
                 # Fallback: média ponderada simples (menos preciso)
+                totalReturn = sum((a["expectedReturn"] or 0) * (a["weight"]/100) for a in assets)
                 totalRisk = sum((a["cvar"] or 0) * (a["weight"]/100) for a in assets)
         
+        # Fallback final se não conseguiu calcular
+        if totalReturn is None:
+            totalReturn = sum((a["expectedReturn"] or 0) * (a["weight"]/100) for a in assets)
         if totalRisk is None:
             totalRisk = sum((a["cvar"] or 0) * (a["weight"]/100) for a in assets)
         return {
@@ -430,6 +531,31 @@ def add_asset_to_portfolio(data: dict):
         cur.execute("INSERT INTO portfolio_ativos (portfolio_id, ativo_id, peso) VALUES (%s,%s,%s)",
                     (portfolio_id, ativo_id, weight/100))
         conn.commit()
+        
+        # Buscar ticker do ativo
+        cur.execute("SELECT ticker FROM ativos WHERE id = %s", (ativo_id,))
+        result = cur.fetchone()
+        if result:
+            ticker = result[0]
+            normalized_ticker = normalize_ticker(ticker)
+            
+            # Verificar se ticker já existe no banco de histórico
+            cur.execute("SELECT COUNT(*) as count FROM historico WHERE ticker = %s", (normalized_ticker,))
+            exists = cur.fetchone()[0] > 0
+            
+            if not exists:
+                # Sincronizar ticker no banco em background
+                print(f"[ASSET] Novo ativo {normalized_ticker} adicionado, sincronizando no banco...")
+                def sync_ticker():
+                    try:
+                        from price_cache import sync_tickers_to_db
+                        sync_tickers_to_db([normalized_ticker], period="5y")
+                        print(f"[ASSET] ✓ {normalized_ticker} sincronizado no banco")
+                    except Exception as e:
+                        print(f"[ASSET] ✗ Erro ao sincronizar {normalized_ticker}: {e}")
+                
+                threading.Thread(target=sync_ticker, daemon=True).start()
+        
         return {"msg": "Ativo adicionado ao portfólio"}
     finally:
         cur.close()
@@ -525,36 +651,45 @@ def optimize_portfolio(data: dict):
             weights = np.array([float(r["peso"]) for r in rows])
             print(f"[OTIMIZAÇÃO] Tickers encontrados: {tickers}")
 
-            update_progress(15, f"Buscando dados históricos de {len(tickers)} ativos...", "fetching_prices")
-            print(f"[OTIMIZAÇÃO] Progresso: 15% - Buscando dados históricos de {len(tickers)} ativos")
-            return_matrix = get_returns_matrix(tickers, period="2y")
-            print(f"[OTIMIZAÇÃO] Matriz de retornos obtida: {return_matrix.shape}")
+            update_progress(15, f"Buscando dados históricos de {len(tickers)} ativos (período amostral: 2020-2024)...", "fetching_prices")
+            print(f"[OTIMIZAÇÃO] Progresso: 15% - Buscando dados históricos de {len(tickers)} ativos (período amostral: 2020-2024)")
+            # AG usa dados do período amostral: 2020-01-01 até 2024-12-31
+            start_date_ga = "2020-01-01"
+            end_date_ga = "2024-12-31"
+            return_matrix = get_returns_matrix(tickers, start_date=start_date_ga, end_date=end_date_ga)
+            print(f"[OTIMIZAÇÃO] Matriz de retornos obtida: {return_matrix.shape} (período: {start_date_ga} até {end_date_ga})")
             
             update_progress(40, "Calculando métricas dos ativos...", "computing_metrics")
             print(f"[OTIMIZAÇÃO] Progresso: 40% - Calculando métricas dos ativos")
             # Calcular retorno e risco originais usando o mesmo método do portfólio
             try:
-                # Retorno: média ponderada simples (correto)
-                metrics = compute_asset_metrics(tickers, period="1y")
-                original_returns = np.array([metrics.get(normalize_ticker(t), {}).get("expectedReturn", 0.1) for t in tickers])
-                original_return = np.sum(weights * original_returns)
+                # Normalizar pesos para somar 1
+                weights_normalized = weights / weights.sum() if weights.sum() > 0 else weights
                 
-                # Risco: usar cálculo correto do portfólio considerando correlação (mesmo método usado em get_portfolio)
-                try:
-                    # Normalizar pesos para somar 1
-                    weights_normalized = weights / weights.sum() if weights.sum() > 0 else weights
-                    original_metrics = calculate_portfolio_metrics(tickers, weights_normalized, period="1y")
-                    original_risk = original_metrics.get("cvar", 0.0)
-                    print(f"[OTIMIZAÇÃO] Risco original calculado com correlação: {original_risk:.2f}%")
-                except Exception as e:
-                    print(f"[AVISO] Erro ao calcular risco original com correlação, usando fallback: {e}")
-                    # Fallback: média ponderada simples
-                    original_risks = np.array([metrics.get(normalize_ticker(t), {}).get("cvar", 0.05) for t in tickers])
-                    original_risk = np.sum(weights * original_risks)
+                # Calcular métricas do portfólio original usando log returns
+                original_metrics = calculate_portfolio_metrics(tickers, weights_normalized, period="1y")
+                original_return = original_metrics.get("retorno_medio", 0.0)
+                original_risk = original_metrics.get("cvar", 0.0)
+                print(f"[OTIMIZAÇÃO] Retorno original calculado: {original_return:.2f}%, Risco original: {original_risk:.2f}%")
+                
+                # Métricas dos ativos individuais para fallback
+                metrics = compute_asset_metrics(tickers, period="1y")
+                
             except Exception as e:
-                print(f"[ERRO] Falha ao calcular métricas originais: {e}")
-                original_return = np.sum(weights * np.array([0.1]*len(weights)))
-                original_risk = np.sum(weights * np.array([0.05]*len(weights)))
+                print(f"[AVISO] Erro ao calcular métricas originais, usando fallback: {e}")
+                # Fallback: calcular usando métricas individuais
+                try:
+                    metrics = compute_asset_metrics(tickers, period="1y")
+                    original_returns = np.array([metrics.get(normalize_ticker(t), {}).get("expectedReturn", 10.0) for t in tickers])
+                    original_risks = np.array([metrics.get(normalize_ticker(t), {}).get("cvar", 5.0) for t in tickers])
+                    # Normalizar pesos
+                    weights_normalized = weights / weights.sum() if weights.sum() > 0 else weights
+                    original_return = np.sum(weights_normalized * original_returns)
+                    original_risk = np.sum(weights_normalized * original_risks)
+                except Exception as e2:
+                    print(f"[ERRO] Fallback também falhou: {e2}")
+                    original_return = 10.0  # valor padrão
+                    original_risk = 5.0
 
             update_progress(50, f"Executando NSGA-II ({populacao} indivíduos, {geracoes} gerações)...", "running_ga")
             print(f"[OTIMIZAÇÃO] Progresso: 50% - Executando NSGA-II ({populacao} indivíduos, {geracoes} gerações)")
@@ -638,6 +773,67 @@ def optimize_portfolio(data: dict):
                 performance_data = performance_series.to_dict('records') if not performance_series.empty else []
                 original_performance_data = original_performance_series.to_dict('records') if not original_performance_series.empty else []
                 
+                # Calcular backtesting (performance real dos últimos 4 meses)
+                print(f"[OTIMIZAÇÃO] Calculando backtesting (últimos 4 meses)...")
+                try:
+                    backtest_results = calculate_backtest_performance(
+                        tickers=tickers,
+                        original_weights=original_weights_array,
+                        optimized_weights=optimized_weights_array,
+                        test_period_months=4
+                    )
+                    
+                    backtest_series = get_backtest_series(
+                        tickers=tickers,
+                        original_weights=original_weights_array,
+                        optimized_weights=optimized_weights_array,
+                        test_period_months=4
+                    )
+                    print(f"[OTIMIZAÇÃO] Backtesting concluído (últimos 4 meses): Original={backtest_results['original']['return_pct']:.2f}%, Otimizado={backtest_results['optimized']['return_pct']:.2f}%")
+                except Exception as e_backtest:
+                    print(f"[AVISO] Erro ao calcular backtesting: {e_backtest}")
+                    import traceback
+                    traceback.print_exc()
+                    backtest_results = None
+                    backtest_series = None
+                
+                # Calcular contribuição de risco por CVaR
+                print(f"[OTIMIZAÇÃO] Calculando contribuição de risco por CVaR...")
+                risk_contribution_data = None
+                try:
+                    price_df_for_risk = get_price_history(tickers, period="1y")
+                    log_returns_for_risk = np.log(price_df_for_risk / price_df_for_risk.shift(1)).dropna()
+                    
+                    risk_contribution_detail = calculate_cvar_contribution_detailed(
+                        tickers=tickers,
+                        weights=optimized_weights_array,
+                        returns_df=log_returns_for_risk,
+                        alpha=0.95
+                    )
+                    
+                    # Formatar contribuição de risco
+                    risk_contribution_data = {
+                        "assets": []
+                    }
+                    for i, ticker in enumerate(tickers):
+                        original_ticker = rows[i]["ticker"]
+                        contribution = risk_contribution_detail.get(ticker, {})
+                        risk_contribution_data["assets"].append({
+                            "ticker": original_ticker,
+                            "weight": float(optimized_weights_array[i] * 100),
+                            "contribution_pct": contribution.get("contribution_pct", 0.0),
+                            "marginal_contribution": contribution.get("marginal_contribution", 0.0),
+                            "component_cvar": contribution.get("component_cvar", 0.0),
+                            "explanation": f"Contribui com {contribution.get('contribution_pct', 0.0):.2f}% do risco total do portfólio. CVaR individual: {contribution.get('component_cvar', 0.0):.2f}%"
+                        })
+                    
+                    print(f"[OTIMIZAÇÃO] Contribuição de risco calculada para {len(risk_contribution_data['assets'])} ativos")
+                except Exception as e_risk:
+                    print(f"[AVISO] Erro ao calcular contribuição de risco: {e_risk}")
+                    import traceback
+                    traceback.print_exc()
+                    risk_contribution_data = None
+                
             except Exception as e:
                 print(f"[ERRO] Falha ao calcular séries temporais: {e}")
                 import traceback
@@ -646,6 +842,9 @@ def optimize_portfolio(data: dict):
                 original_performance_data = []
                 optimized_metrics = {}
                 original_metrics = {}
+                backtest_results = None
+                backtest_series = None
+                risk_contribution_data = None
                 # Calcular alocação setorial mesmo em caso de erro nas séries
                 sector_allocation = {}
                 try:
@@ -659,6 +858,59 @@ def optimize_portfolio(data: dict):
                 except Exception as e2:
                     print(f"[ERRO] Falha ao calcular alocação setorial: {e2}")
                     sector_allocation = {"Outros": 100.0}
+            
+            # Tentar calcular backtesting e contribuição de risco mesmo se houver erro anterior
+            if backtest_results is None:
+                try:
+                    optimized_weights_array = np.array([w / 100 for w in best["pesos_pct"]])
+                    original_weights_array = np.array(weights)
+                    backtest_results = calculate_backtest_performance(
+                        tickers=tickers,
+                        original_weights=original_weights_array,
+                        optimized_weights=optimized_weights_array,
+                        test_period_months=4
+                    )
+                    backtest_series = get_backtest_series(
+                        tickers=tickers,
+                        original_weights=original_weights_array,
+                        optimized_weights=optimized_weights_array,
+                        test_period_months=4
+                    )
+                except Exception as e_backtest:
+                    print(f"[AVISO] Erro ao calcular backtesting no fallback: {e_backtest}")
+                    backtest_results = None
+                    backtest_series = None
+            
+            if risk_contribution_data is None:
+                try:
+                    optimized_weights_array = np.array([w / 100 for w in best["pesos_pct"]])
+                    price_df_for_risk = get_price_history(tickers, period="1y")
+                    log_returns_for_risk = np.log(price_df_for_risk / price_df_for_risk.shift(1)).dropna()
+                    
+                    risk_contribution_detail = calculate_cvar_contribution_detailed(
+                        tickers=tickers,
+                        weights=optimized_weights_array,
+                        returns_df=log_returns_for_risk,
+                        alpha=0.95
+                    )
+                    
+                    risk_contribution_data = {
+                        "assets": []
+                    }
+                    for i, ticker in enumerate(tickers):
+                        original_ticker = rows[i]["ticker"]
+                        contribution = risk_contribution_detail.get(ticker, {})
+                        risk_contribution_data["assets"].append({
+                            "ticker": original_ticker,
+                            "weight": float(optimized_weights_array[i] * 100),
+                            "contribution_pct": contribution.get("contribution_pct", 0.0),
+                            "marginal_contribution": contribution.get("marginal_contribution", 0.0),
+                            "component_cvar": contribution.get("component_cvar", 0.0),
+                            "explanation": f"Contribui com {contribution.get('contribution_pct', 0.0):.2f}% do risco total do portfólio. CVaR individual: {contribution.get('component_cvar', 0.0):.2f}%"
+                        })
+                except Exception as e_risk:
+                    print(f"[AVISO] Erro ao calcular contribuição de risco no fallback: {e_risk}")
+                    risk_contribution_data = None
             
             result = {
                 "originalReturn": original_return_val,
@@ -675,6 +927,9 @@ def optimize_portfolio(data: dict):
                 "optimizedMetrics": optimized_metrics,
                 "originalMetrics": original_metrics,
                 "sectorAllocation": sector_allocation,
+                "backtestResults": backtest_results,
+                "backtestSeries": backtest_series,
+                "riskContribution": risk_contribution_data,
             }
             
             print(f"[OTIMIZAÇÃO] Resultado final: originalReturn={result['originalReturn']:.2f}%, optimizedReturn={result['optimizedReturn']:.2f}%, optimizedRisk={result['optimizedRisk']:.2f}%")
@@ -855,13 +1110,15 @@ def get_portfolio_analytics(portfolio_id: str):
     3. Métricas quantitativas
     """
     try:
-        conn = db.get_connection()
+        conn = get_db_conn()
         cur = conn.cursor(dictionary=True)
         
         # Buscar portfólio
         cur.execute("SELECT * FROM portfolios WHERE id = %s", (portfolio_id,))
         portfolio = cur.fetchone()
         if not portfolio:
+            cur.close()
+            conn.close()
             raise HTTPException(status_code=404, detail="Portfólio não encontrado")
         
         # Buscar ativos do portfólio
@@ -873,6 +1130,7 @@ def get_portfolio_analytics(portfolio_id: str):
         """, (portfolio_id,))
         assets = cur.fetchall()
         cur.close()
+        conn.close()
         
         if not assets:
             raise HTTPException(status_code=400, detail="Portfólio sem ativos")
@@ -979,23 +1237,47 @@ def get_portfolio_analytics(portfolio_id: str):
         # =====================
         
         try:
-            # Retornar histórico para cálculo de métricas
-            price_history = get_price_history(tickers, '2y')
-            returns_matrix = get_returns_matrix(tickers, '2y')
+            # Calcular métricas usando a função correta que espera tickers, weights, period
+            portfolio_metrics_dict = calculate_portfolio_metrics(tickers, weights, '2y')
+            base_metrics_dict = calculate_portfolio_metrics(tickers, base_weights, '2y')
             
-            if returns_matrix.shape[0] > 1:
-                # Portfólio otimizado
-                portfolio_returns = returns_matrix @ weights
-                portfolio_metrics = calculate_portfolio_metrics(portfolio_returns)
-                
-                # Portfólio base
-                base_returns = returns_matrix @ base_weights
-                base_metrics = calculate_portfolio_metrics(base_returns)
-                
-                # Ibovespa
-                if not ibov_df.empty:
-                    ibov_returns = ibov_df['ibovespa'].pct_change().dropna().values / 100
-                    ibov_metrics = calculate_portfolio_metrics(ibov_returns)
+            # Converter para o formato esperado
+            portfolio_metrics = {
+                'retorno_anual': portfolio_metrics_dict.get('retorno_medio', 0),
+                'volatilidade': portfolio_metrics_dict.get('volatilidade', 0),
+                'cvar': portfolio_metrics_dict.get('cvar', 0),
+                'sharpe': portfolio_metrics_dict.get('sharpe', 0),
+                'desvio_padrao': portfolio_metrics_dict.get('desvio_padrao', 0)
+            }
+            
+            base_metrics = {
+                'retorno_anual': base_metrics_dict.get('retorno_medio', 0),
+                'volatilidade': base_metrics_dict.get('volatilidade', 0),
+                'cvar': base_metrics_dict.get('cvar', 0),
+                'sharpe': base_metrics_dict.get('sharpe', 0),
+                'desvio_padrao': base_metrics_dict.get('desvio_padrao', 0)
+            }
+            
+            # Ibovespa - calcular métricas aproximadas a partir da série
+            if not ibov_df.empty and 'ibovespa' in ibov_df.columns:
+                ibov_values = ibov_df['ibovespa'].values / 100  # Converter de % para decimal
+                if len(ibov_values) > 1:
+                    # Calcular retorno médio anualizado aproximado
+                    total_return = ibov_values[-1] - ibov_values[0]
+                    days = len(ibov_values)
+                    annual_return = (1 + total_return) ** (252 / days) - 1 if days > 0 else 0
+                    
+                    # Calcular volatilidade aproximada
+                    returns = np.diff(ibov_values) / (1 + ibov_values[:-1])
+                    volatility = np.std(returns) * np.sqrt(252) if len(returns) > 0 else 0
+                    
+                    ibov_metrics = {
+                        'retorno_anual': annual_return * 100,
+                        'volatilidade': volatility * 100,
+                        'cvar': volatility * 100 * 1.5,  # Aproximação
+                        'sharpe': (annual_return / volatility) if volatility > 0 else 0,
+                        'desvio_padrao': volatility * 100
+                    }
                 else:
                     ibov_metrics = {
                         'retorno_anual': 0,
@@ -1004,25 +1286,27 @@ def get_portfolio_analytics(portfolio_id: str):
                         'sharpe': 0,
                         'desvio_padrao': 0
                     }
-                
-                # SELIC (aproximado)
-                selic_metrics = {
-                    'retorno_anual': 0.032 * 252 * 100,  # ~8% a.a.
-                    'volatilidade': 0.1,
-                    'cvar': 0,
-                    'sharpe': 0,
-                    'desvio_padrao': 0.1
-                }
             else:
-                portfolio_metrics = base_metrics = ibov_metrics = selic_metrics = {
+                ibov_metrics = {
                     'retorno_anual': 0,
                     'volatilidade': 0,
                     'cvar': 0,
                     'sharpe': 0,
                     'desvio_padrao': 0
                 }
+            
+            # SELIC (aproximado)
+            selic_metrics = {
+                'retorno_anual': 11.75,  # ~11.75% a.a. (taxa atual aproximada)
+                'volatilidade': 0.1,
+                'cvar': 0.05,
+                'sharpe': 0,
+                'desvio_padrao': 0.1
+            }
         except Exception as e:
             print(f"Erro ao calcular métricas: {e}")
+            import traceback
+            traceback.print_exc()
             portfolio_metrics = base_metrics = ibov_metrics = selic_metrics = {
                 'retorno_anual': 0,
                 'volatilidade': 0,
@@ -1038,8 +1322,6 @@ def get_portfolio_analytics(portfolio_id: str):
             'selic': selic_metrics
         }
         
-        conn.close()
-        
         return {
             'temporal_evolution': temporal_data,
             'sectoral_allocation': sectoral_data,
@@ -1050,5 +1332,168 @@ def get_portfolio_analytics(portfolio_id: str):
         raise
     except Exception as e:
         print(f"Erro em analytics: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -------------------------
+# PREÇOS ATUAIS
+# -------------------------
+
+@app.post("/prices/update")
+def update_current_prices(data: dict = None):
+    """
+    Atualiza preços atuais de todos os tickers dos portfólios.
+    Executa em background para não bloquear a requisição.
+    """
+    def update_prices_background():
+        try:
+            print("[PRICES] Iniciando atualização de preços atuais...")
+            conn = get_db_conn()
+            cur = conn.cursor(dictionary=True)
+            
+            # Buscar todos os tickers únicos dos portfólios
+            cur.execute("""
+                SELECT DISTINCT a.ticker
+                FROM ativos a
+                JOIN portfolio_ativos pa ON pa.ativo_id = a.id
+            """)
+            tickers = [row['ticker'] for row in cur.fetchall()]
+            cur.close()
+            conn.close()
+            
+            if not tickers:
+                print("[PRICES] Nenhum ticker encontrado")
+                return
+            
+            print(f"[PRICES] Atualizando {len(tickers)} tickers...")
+            updated = 0
+            failed = 0
+            
+            for ticker in tickers:
+                try:
+                    normalized_ticker = normalize_ticker(ticker)
+                    price = get_current_price(normalized_ticker)
+                    if price is not None:
+                        upsert_current_price(normalized_ticker, price)
+                        updated += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    print(f"[PRICES] Erro ao atualizar {ticker}: {e}")
+                    failed += 1
+            
+            print(f"[PRICES] Atualização concluída: {updated} atualizados, {failed} falhas")
+        except Exception as e:
+            print(f"[PRICES] Erro na atualização de preços: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Executar em background
+    threading.Thread(target=update_prices_background, daemon=True).start()
+    
+    return {"message": "Atualização de preços iniciada em background"}
+
+
+@app.get("/portfolio/{portfolio_id}/risk-contribution")
+def get_risk_contribution(portfolio_id: int):
+    """
+    Calcula a contribuição de risco por CVaR para cada ativo do portfólio.
+    Mostra quanto cada ativo contribui para o risco total do portfólio.
+    """
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor(dictionary=True)
+        
+        # Buscar portfólio
+        cur.execute("SELECT id, titulo FROM portfolios WHERE id = %s", (portfolio_id,))
+        portfolio = cur.fetchone()
+        if not portfolio:
+            raise HTTPException(status_code=404, detail="Portfólio não encontrado")
+        
+        # Buscar ativos
+        cur.execute("""
+            SELECT a.ticker, pa.peso
+            FROM portfolio_ativos pa
+            JOIN ativos a ON a.id = pa.ativo_id
+            WHERE pa.portfolio_id = %s
+        """, (portfolio_id,))
+        assets = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        if len(assets) < 2:
+            raise HTTPException(status_code=400, detail="Portfólio precisa ter pelo menos 2 ativos")
+        
+        tickers = [normalize_ticker(a["ticker"]) for a in assets]
+        weights = np.array([float(a["peso"] or 0) for a in assets])
+        
+        if weights.sum() <= 0:
+            raise HTTPException(status_code=400, detail="Pesos inválidos")
+        
+        # Normalizar pesos
+        weights = weights / weights.sum()
+        
+        # Buscar retornos históricos
+        try:
+            price_df = get_price_history(tickers, period="1y")
+            # Converter para retornos logarítmicos, depois para DataFrame simples para Riskfolio
+            log_returns = np.log(price_df / price_df.shift(1)).dropna()
+            
+            # Calcular contribuição de risco detalhada
+            contribution_detailed = calculate_cvar_contribution_detailed(
+                tickers=tickers,
+                weights=weights,
+                returns_df=log_returns,
+                alpha=0.95
+            )
+            
+            # Preparar resultado
+            result = {
+                "portfolio_id": portfolio_id,
+                "portfolio_name": portfolio["titulo"],
+                "assets": []
+            }
+            
+            for i, ticker in enumerate(tickers):
+                original_ticker = assets[i]["ticker"]
+                contribution = contribution_detailed.get(ticker, {})
+                
+                result["assets"].append({
+                    "ticker": original_ticker,
+                    "weight": float(weights[i] * 100),  # em %
+                    "contribution_pct": contribution.get("contribution_pct", 0.0),
+                    "marginal_contribution": contribution.get("marginal_contribution", 0.0),
+                    "component_cvar": contribution.get("component_cvar", 0.0),
+                    "explanation": f"Contribui com {contribution.get('contribution_pct', 0.0):.2f}% do risco total do portfólio. CVaR individual: {contribution.get('component_cvar', 0.0):.2f}%"
+                })
+            
+            # Calcular CVaR total do portfólio para referência
+            portfolio_returns = (log_returns * weights).sum(axis=1)
+            portfolio_returns_simple = np.exp(portfolio_returns) - 1
+            
+            try:
+                import riskfolio as rp
+                portfolio_cvar = float(rp.RiskFunctions.CVaR_Hist(returns=portfolio_returns_simple, alpha=0.95) * 100)
+            except:
+                # Fallback: usar função do ga.py
+                from ga import compute_cvar_daily
+                cvar_daily = compute_cvar_daily(portfolio_returns_simple.values, alpha=0.95)
+                portfolio_cvar = float(cvar_daily * np.sqrt(252) * 100)
+            
+            result["portfolio_cvar"] = portfolio_cvar
+            result["total_contribution"] = sum(a["contribution_pct"] for a in result["assets"])
+            
+            return result
+            
+        except Exception as e:
+            print(f"[ERRO] Falha ao calcular contribuição de risco: {e}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Erro ao calcular contribuição de risco: {str(e)}")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERRO] Erro em risk-contribution: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 

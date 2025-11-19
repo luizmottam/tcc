@@ -7,6 +7,8 @@ import { Progress } from "@/components/ui/progress";
 import { ArrowLeft, Zap, TrendingUp, ArrowUpRight, ArrowDownRight, AlertTriangle } from "lucide-react";
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, PieChart, Pie, Cell, ScatterChart, Scatter } from "recharts";
 import { toast } from "sonner";
+import { BacktestComparisonCard } from "@/components/BacktestComparisonCard";
+import { OptimizationRiskContribution } from "@/components/OptimizationRiskContribution";
 
 const COLORS = ["#10b981", "#059669", "#047857", "#ef4444", "#facc15"];
 
@@ -28,6 +30,9 @@ const PortfolioOptimization = () => {
   const [sectorAllocation, setSectorAllocation] = useState<Record<string, number>>({});
   const [optimizedMetrics, setOptimizedMetrics] = useState<any>(null);
   const [originalMetrics, setOriginalMetrics] = useState<any>(null);
+  const [backtestResults, setBacktestResults] = useState<any>(null);
+  const [backtestSeries, setBacktestSeries] = useState<any>(null);
+  const [riskContribution, setRiskContribution] = useState<any>(null);
   const [applySaving, setApplySaving] = useState(false);
   const [applySaved, setApplySaved] = useState(false);
 
@@ -153,6 +158,22 @@ const PortfolioOptimization = () => {
         }
       }
 
+      // Configurar backtesting (performance real)
+      if (optData.backtestResults) {
+        console.log("Resultados de backtesting recebidos:", optData.backtestResults);
+        setBacktestResults(optData.backtestResults);
+      }
+      if (optData.backtestSeries) {
+        console.log("Série de backtesting recebida:", optData.backtestSeries);
+        setBacktestSeries(optData.backtestSeries);
+      }
+
+      // Configurar contribuição de risco
+      if (optData.riskContribution) {
+        console.log("Contribuição de risco recebida:", optData.riskContribution);
+        setRiskContribution(optData.riskContribution);
+      }
+
       toast.success("Otimização concluída com sucesso!");
     } catch (err) {
       console.error("Erro na otimização:", err);
@@ -226,6 +247,9 @@ const PortfolioOptimization = () => {
       setPerformanceData([]);
       setOriginalPerformanceData([]);
       setGaHistory([]);
+      setBacktestResults(null);
+      setBacktestSeries(null);
+      setRiskContribution(null);
 
       // atualizar portfólio
       await loadPortfolio();
@@ -559,6 +583,19 @@ const PortfolioOptimization = () => {
               Tentar novamente
             </Button>
           </Card>
+        )}
+
+        {/* Backtesting - Performance Real */}
+        {optimized && !optimizing && backtestResults && (
+          <BacktestComparisonCard 
+            backtestResults={backtestResults} 
+            backtestSeries={backtestSeries} 
+          />
+        )}
+
+        {/* Contribuição de Risco */}
+        {optimized && !optimizing && riskContribution && (
+          <OptimizationRiskContribution riskContribution={riskContribution} />
         )}
 
         {/* Gráfico de Evolução Temporal */}

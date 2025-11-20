@@ -8,7 +8,18 @@ interface BacktestComparisonCardProps {
 }
 
 export const BacktestComparisonCard = ({ backtestResults, backtestSeries }: BacktestComparisonCardProps) => {
-  if (!backtestResults || !backtestSeries) {
+  // Verificar se os dados necessários existem
+  if (!backtestResults) {
+    return null;
+  }
+  
+  // Se backtestSeries não existe ou está vazio, não renderizar
+  if (!backtestSeries || (Array.isArray(backtestSeries) && backtestSeries.length === 0)) {
+    return null;
+  }
+  
+  // Se backtestSeries é um objeto mas não tem dates nem é um array, não renderizar
+  if (typeof backtestSeries === 'object' && !Array.isArray(backtestSeries) && !backtestSeries.dates) {
     return null;
   }
 
@@ -17,21 +28,49 @@ export const BacktestComparisonCard = ({ backtestResults, backtestSeries }: Back
   const improvement = backtestResults.improvement || {};
 
   // Preparar dados para o gráfico
-  const chartData = backtestSeries.dates.map((date: string, index: number) => ({
-    date: new Date(date).toLocaleDateString('pt-BR', { month: 'short', day: 'numeric' }),
-    original: backtestSeries.original[index]?.cumulative_return || 0,
-    optimized: backtestSeries.optimized[index]?.cumulative_return || 0,
-  }));
+  // backtestSeries pode ser um array simples ou um objeto com dates/original/optimized
+  let chartData: any[] = [];
+  
+  if (backtestSeries?.dates && Array.isArray(backtestSeries.dates)) {
+    // Estrutura esperada: objeto com dates, original, optimized
+    const dates = backtestSeries.dates || [];
+    const originalSeries = backtestSeries.original || [];
+    const optimizedSeries = backtestSeries.optimized || [];
+    
+    chartData = dates.map((date: string, index: number) => ({
+      date: new Date(date).toLocaleDateString('pt-BR', { month: 'short', day: 'numeric' }),
+      original: originalSeries[index]?.cumulative_return || originalSeries[index] || 0,
+      optimized: optimizedSeries[index]?.cumulative_return || optimizedSeries[index] || 0,
+    }));
+  } else if (Array.isArray(backtestSeries)) {
+    // Estrutura alternativa: array simples de retornos
+    // Gerar datas fictícias baseadas no tamanho do array
+    const today = new Date();
+    chartData = backtestSeries.map((value: number, index: number) => {
+      const date = new Date(today);
+      date.setDate(date.getDate() - (backtestSeries.length - index));
+      return {
+        date: date.toLocaleDateString('pt-BR', { month: 'short', day: 'numeric' }),
+        original: 0, // Não temos dados originais neste formato
+        optimized: value || 0,
+      };
+    });
+  }
 
   return (
     <Card className="p-6 mb-6 shadow-card animate-fade-in">
       <div className="flex items-center gap-2 mb-4">
         <BarChart3 className="w-5 h-5 text-primary" />
-        <h3 className="text-xl font-bold">Performance Real (Backtesting - Últimos 4 Meses)</h3>
+        <h3 className="text-xl font-bold">Performance Real (Backtesting - Últimos 6 Meses)</h3>
       </div>
       <p className="text-sm text-muted-foreground mb-6">
-        Comparação do desempenho real caso você tivesse aplicado a otimização há {backtestResults.test_period_months || 4} meses.
-        Baseado em dados históricos reais dos últimos {backtestResults.test_period_months || 4} meses ({backtestResults.period_days || 0} dias úteis).
+        Comparação do desempenho real caso você tivesse aplicado a otimização há {backtestResults.test_period_months || 6} meses.
+        Baseado em dados históricos reais dos últimos {backtestResults.test_period_months || 6} meses ({backtestResults.period_days || 0} dias úteis).
+        {backtestResults.start_date && backtestResults.end_date && (
+          <span className="block mt-1">
+            Período de teste: {new Date(backtestResults.start_date).toLocaleDateString('pt-BR')} até {new Date(backtestResults.end_date).toLocaleDateString('pt-BR')}
+          </span>
+        )}
       </p>
 
       {/* Cards de Comparação */}
@@ -50,7 +89,7 @@ export const BacktestComparisonCard = ({ backtestResults, backtestSeries }: Back
               </span>
             </div>
             <div className="flex justify-between items-center">
-              <span className="text-sm">Retorno Acumulado (6 meses)</span>
+              <span className="text-sm">Retorno Acumulado ({backtestResults.test_period_months || 6} meses)</span>
               <span className={`font-semibold ${original.cumulative_return_pct >= 0 ? 'text-success' : 'text-destructive'}`}>
                 {original.cumulative_return_pct?.toFixed(2) || '0.00'}%
               </span>
@@ -58,7 +97,11 @@ export const BacktestComparisonCard = ({ backtestResults, backtestSeries }: Back
             <div className="flex justify-between items-center">
               <span className="text-sm">CVaR (95%)</span>
               <span className="font-semibold text-foreground">
-                {original.cvar_pct?.toFixed(2) || '0.00'}%
+                {(() => {
+                  const cvar = original.cvar_pct ?? 0;
+                  // CVaR agora vem em decimal, converter para % apenas na exibição
+                  return (cvar * 100).toFixed(2);
+                })()}%
               </span>
             </div>
             <div className="flex justify-between items-center pt-2 border-t">
@@ -92,7 +135,7 @@ export const BacktestComparisonCard = ({ backtestResults, backtestSeries }: Back
               </span>
             </div>
             <div className="flex justify-between items-center">
-              <span className="text-sm">Retorno Acumulado ({backtestResults.test_period_months || 4} meses)</span>
+              <span className="text-sm">Retorno Acumulado ({backtestResults.test_period_months || 6} meses)</span>
               <span className={`font-semibold ${optimized.cumulative_return_pct >= 0 ? 'text-success' : 'text-destructive'}`}>
                 {optimized.cumulative_return_pct?.toFixed(2) || '0.00'}%
               </span>
@@ -100,7 +143,11 @@ export const BacktestComparisonCard = ({ backtestResults, backtestSeries }: Back
             <div className="flex justify-between items-center">
               <span className="text-sm">CVaR (95%)</span>
               <span className="font-semibold text-foreground">
-                {optimized.cvar_pct?.toFixed(2) || '0.00'}%
+                {(() => {
+                  const cvar = optimized.cvar_pct ?? 0;
+                  // CVaR agora vem em decimal, converter para % apenas na exibição
+                  return (cvar * 100).toFixed(2);
+                })()}%
                 {improvement.risk_delta < 0 && <span className="text-xs ml-1 text-success">↓</span>}
               </span>
             </div>
@@ -118,7 +165,7 @@ export const BacktestComparisonCard = ({ backtestResults, backtestSeries }: Back
       {/* Gráfico de Comparação */}
       {chartData.length > 0 && (
         <div className="mt-6">
-          <h4 className="font-semibold mb-4">Evolução do Retorno Acumulado ({backtestResults.test_period_months || 4} meses)</h4>
+          <h4 className="font-semibold mb-4">Evolução do Retorno Acumulado ({backtestResults.test_period_months || 6} meses)</h4>
           <ResponsiveContainer width="100%" height={350}>
             <LineChart data={chartData} margin={{ top: 5, right: 30, left: 20, bottom: 60 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />

@@ -1,43 +1,398 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { Portfolio, Asset, OptimizationResult } from "@/types/portfolio";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { ArrowLeft, Zap, TrendingUp, ArrowUpRight, ArrowDownRight, AlertTriangle } from "lucide-react";
-import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, PieChart, Pie, Cell, ScatterChart, Scatter } from "recharts";
+import { ArrowLeft, Zap, TrendingUp, ArrowUpRight, ArrowDownRight, AlertTriangle, Star, Target, BarChart3 } from "lucide-react";
+import {
+  ResponsiveContainer,
+  ScatterChart,
+  Scatter,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  Cell,
+} from "recharts";
 import { toast } from "sonner";
 import { BacktestComparisonCard } from "@/components/BacktestComparisonCard";
 import { OptimizationRiskContribution } from "@/components/OptimizationRiskContribution";
 
-const COLORS = ["#10b981", "#059669", "#047857", "#ef4444", "#facc15"];
+const API_BASE = ((import.meta as any).env?.VITE_API_URL as string | undefined) ?? "http://localhost:8000";
+
+// ============================================================================
+// TIPOS E INTERFACES
+// ============================================================================
+
+interface PortfolioMetrics {
+  return: number;
+  risk: number;
+  cvar: number;
+  sharpe: number;
+}
+
+interface EfficientFrontierPoint {
+  risk: number;
+  return: number;
+  sharpe: number;
+  weights: number[];
+}
+
+interface OptimizationData {
+  original: PortfolioMetrics;
+  optimized: PortfolioMetrics;
+  efficientFrontier: EfficientFrontierPoint[];
+  bestSharpe: EfficientFrontierPoint | null;
+  minRisk: EfficientFrontierPoint | null;
+  cvarFrontier: EfficientFrontierPoint[];
+  bestCvarSharpe: EfficientFrontierPoint | null;
+}
+
+// ============================================================================
+// FUNÇÕES DE CÁLCULO FINANCEIRO
+// ============================================================================
+
+/**
+ * Calcula retornos logarítmicos a partir de preços
+ */
+function calculateLogReturns(prices: number[][]): number[][] {
+  const returns: number[][] = [];
+  for (let i = 1; i < prices.length; i++) {
+    const row: number[] = [];
+    for (let j = 0; j < prices[i].length; j++) {
+      if (prices[i - 1][j] > 0 && prices[i][j] > 0) {
+        row.push(Math.log(prices[i][j] / prices[i - 1][j]));
+      } else {
+        row.push(0);
+      }
+    }
+    returns.push(row);
+  }
+  return returns;
+}
+
+/**
+ * Calcula média anualizada dos retornos
+ */
+function calculateAnnualizedMean(returns: number[], tradingDays: number = 252): number {
+  if (returns.length === 0) return 0;
+  const mean = returns.reduce((sum, r) => sum + r, 0) / returns.length;
+  return mean * tradingDays;
+}
+
+/**
+ * Calcula matriz de covariância anualizada
+ */
+function calculateCovarianceMatrix(returns: number[][]): number[][] {
+  const n = returns.length;
+  const m = returns[0]?.length || 0;
+  if (n === 0 || m === 0) return [];
+
+  const tradingDays = 252;
+  const covMatrix: number[][] = [];
+
+  // Calcular médias
+  const means: number[] = [];
+  for (let j = 0; j < m; j++) {
+    let sum = 0;
+    for (let i = 0; i < n; i++) {
+      sum += returns[i][j];
+    }
+    means.push(sum / n);
+  }
+
+  // Calcular covariâncias
+  for (let i = 0; i < m; i++) {
+    const row: number[] = [];
+    for (let j = 0; j < m; j++) {
+      let cov = 0;
+      for (let k = 0; k < n; k++) {
+        cov += (returns[k][i] - means[i]) * (returns[k][j] - means[j]);
+      }
+      cov = (cov / (n - 1)) * tradingDays;
+      row.push(cov);
+    }
+    covMatrix.push(row);
+  }
+
+  return covMatrix;
+}
+
+/**
+ * Calcula retorno do portfólio
+ */
+function calculatePortfolioReturn(weights: number[], meanReturns: number[]): number {
+  if (weights.length !== meanReturns.length) return 0;
+  return weights.reduce((sum, w, i) => sum + w * meanReturns[i], 0);
+}
+
+/**
+ * Calcula risco (desvio padrão) do portfólio
+ */
+function calculatePortfolioRisk(weights: number[], covMatrix: number[][]): number {
+  if (weights.length !== covMatrix.length) return 0;
+  
+  let variance = 0;
+  for (let i = 0; i < weights.length; i++) {
+    for (let j = 0; j < weights.length; j++) {
+      variance += weights[i] * weights[j] * covMatrix[i][j];
+    }
+  }
+  
+  return Math.sqrt(Math.max(0, variance));
+}
+
+/**
+ * Calcula CVaR (Conditional Value at Risk) histórico
+ */
+function calculateCVaR(returns: number[], alpha: number = 0.95): number {
+  if (returns.length === 0) return 0;
+  
+  const sorted = [...returns].sort((a, b) => a - b);
+  const varIndex = Math.floor((1 - alpha) * sorted.length);
+  const varThreshold = sorted[varIndex] || sorted[0];
+  
+  const tailLosses = sorted.filter(r => r <= varThreshold);
+  if (tailLosses.length === 0) return 0;
+  
+  const cvar = tailLosses.reduce((sum, r) => sum + r, 0) / tailLosses.length;
+  return Math.abs(cvar) * Math.sqrt(252); // Anualizar
+}
+
+/**
+ * Calcula CVaR do portfólio usando simulação
+ */
+function calculatePortfolioCVaR(
+  portfolioReturns: number[],
+  alpha: number = 0.95
+): number {
+  return calculateCVaR(portfolioReturns, alpha);
+}
+
+/**
+ * Calcula Sharpe Ratio
+ */
+function calculateSharpeRatio(returnValue: number, risk: number, riskFreeRate: number = 0): number {
+  if (risk === 0) return 0;
+  return (returnValue - riskFreeRate) / risk;
+}
+
+/**
+ * Gera pesos aleatórios normalizados
+ */
+function generateRandomWeights(n: number): number[] {
+  const weights: number[] = [];
+  let sum = 0;
+  
+  for (let i = 0; i < n; i++) {
+    const w = Math.random();
+    weights.push(w);
+    sum += w;
+  }
+  
+  return weights.map(w => w / sum);
+}
+
+/**
+ * Simula fronteira eficiente de Markowitz
+ */
+function simulateEfficientFrontier(
+  meanReturns: number[],
+  covMatrix: number[][],
+  numSimulations: number = 10000
+): EfficientFrontierPoint[] {
+  const frontier: EfficientFrontierPoint[] = [];
+  const n = meanReturns.length;
+  
+  for (let i = 0; i < numSimulations; i++) {
+    const weights = generateRandomWeights(n);
+    const portfolioReturn = calculatePortfolioReturn(weights, meanReturns);
+    const portfolioRisk = calculatePortfolioRisk(weights, covMatrix);
+    const sharpe = calculateSharpeRatio(portfolioReturn, portfolioRisk);
+    
+    frontier.push({
+      risk: portfolioRisk * 100, // Converter para %
+      return: portfolioReturn * 100, // Converter para %
+      sharpe,
+      weights: [...weights],
+    });
+  }
+  
+  return frontier;
+}
+
+/**
+ * Otimiza portfólio por Sharpe Ratio
+ */
+function optimizeBySharpe(
+  meanReturns: number[],
+  covMatrix: number[][],
+  frontier: EfficientFrontierPoint[]
+): EfficientFrontierPoint | null {
+  if (frontier.length === 0) return null;
+  
+  let best = frontier[0];
+  for (const point of frontier) {
+    if (point.sharpe > best.sharpe) {
+      best = point;
+    }
+  }
+  
+  return best;
+}
+
+/**
+ * Encontra portfólio de menor risco
+ */
+function findMinRisk(frontier: EfficientFrontierPoint[]): EfficientFrontierPoint | null {
+  if (frontier.length === 0) return null;
+  
+  let min = frontier[0];
+  for (const point of frontier) {
+    if (point.risk < min.risk) {
+      min = point;
+    }
+  }
+  
+  return min;
+}
+
+/**
+ * Simula fronteira eficiente com CVaR
+ */
+function simulateCvarFrontier(
+  returns: number[][],
+  meanReturns: number[],
+  covMatrix: number[][],
+  numSimulations: number = 10000
+): EfficientFrontierPoint[] {
+  const frontier: EfficientFrontierPoint[] = [];
+  const n = meanReturns.length;
+  
+  for (let i = 0; i < numSimulations; i++) {
+    const weights = generateRandomWeights(n);
+    const portfolioReturn = calculatePortfolioReturn(weights, meanReturns);
+    
+    // Calcular retornos do portfólio
+    const portfolioReturns: number[] = [];
+    for (let j = 0; j < returns.length; j++) {
+      let portfolioReturnDaily = 0;
+      for (let k = 0; k < n; k++) {
+        portfolioReturnDaily += weights[k] * returns[j][k];
+      }
+      portfolioReturns.push(portfolioReturnDaily);
+    }
+    
+    const cvar = calculatePortfolioCVaR(portfolioReturns);
+    const portfolioRisk = calculatePortfolioRisk(weights, covMatrix);
+    const sharpe = calculateSharpeRatio(portfolioReturn, cvar);
+    
+    frontier.push({
+      risk: cvar, // CVaR em decimal
+      return: portfolioReturn * 100, // Retorno em %
+      sharpe,
+      weights: [...weights],
+    });
+  }
+  
+  return frontier;
+}
+
+// ============================================================================
+// COMPONENTE PRINCIPAL
+// ============================================================================
 
 const PortfolioOptimization = () => {
   const { id } = useParams();
   const navigate = useNavigate();
-  const API_BASE = ((import.meta as any).env?.VITE_API_URL as string | undefined) ?? "http://localhost:8000";
 
   const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
   const [loading, setLoading] = useState(true);
   const [optimizing, setOptimizing] = useState(false);
   const [optimizationProgress, setOptimizationProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
-
   const [optimized, setOptimized] = useState<OptimizationResult | null>(null);
-  const [gaHistory, setGaHistory] = useState<Array<{ generation: number; ret: number; cvar: number; fitness: number }>>([]);
-  const [performanceData, setPerformanceData] = useState<Array<{ date: string; portfolio: number; ibovespa: number; selic: number }>>([]);
-  const [originalPerformanceData, setOriginalPerformanceData] = useState<Array<{ date: string; portfolio: number; ibovespa: number; selic: number }>>([]);
-  const [sectorAllocation, setSectorAllocation] = useState<Record<string, number>>({});
-  const [optimizedMetrics, setOptimizedMetrics] = useState<any>(null);
-  const [originalMetrics, setOriginalMetrics] = useState<any>(null);
+  const [optimizationData, setOptimizationData] = useState<OptimizationData | null>(null);
   const [backtestResults, setBacktestResults] = useState<any>(null);
   const [backtestSeries, setBacktestSeries] = useState<any>(null);
   const [riskContribution, setRiskContribution] = useState<any>(null);
+  const [fronteiraTable, setFronteiraTable] = useState<any[]>([]);
   const [applySaving, setApplySaving] = useState(false);
-  const [applySaved, setApplySaved] = useState(false);
 
-  // --- Função para executar otimização ---
-  const runOptimization = async (portfolioId: number, currentPortfolio: Portfolio) => {
+  // Carregar portfólio
+  const loadPortfolio = async () => {
+    if (!id) return;
+    setLoading(true);
+    setError(null);
+    
+    try {
+      const res = await fetch(`${API_BASE}/portfolio/${id}`);
+      if (!res.ok) throw new Error("Portfólio não encontrado");
+      
+      const data = await res.json();
+      const p: Portfolio = {
+        id: String(data.id),
+        name: data.name || "",
+        createdAt: data.createdAt ? new Date(data.createdAt) : new Date(),
+        assets: (data.assets || []).map((a: any) => ({
+          id: String(a.id || ""),
+          ticker: a.ticker || "",
+          sector: a.sector || "",
+          weight: Number(a.weight || 0),
+          expectedReturn: (a?.expectedReturn != null && isFinite(a.expectedReturn)) 
+            ? Math.max(-100, Math.min(500, Number(a.expectedReturn))) 
+            : 0,
+          variance: (a?.variance != null && isFinite(a.variance)) 
+            ? Math.max(0, Math.min(200, Number(a.variance))) 
+            : 0,
+          cvar: (a?.cvar != null && isFinite(a.cvar)) 
+            ? Math.max(0, Math.min(200, Number(a.cvar))) 
+            : 0,
+        })),
+        totalReturn: data.totalReturn ?? 0,
+        totalRisk: data.totalRisk ?? 0,
+        totalCvar: data.totalCvar ?? undefined,
+      };
+      setPortfolio(p);
+    } catch (err) {
+      console.error("Erro ao carregar portfólio:", err);
+      setError(String(err));
+      toast.error(`Erro ao carregar portfólio: ${err}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Buscar dados históricos de preços
+  const fetchHistoricalPrices = async (tickers: string[]): Promise<number[][]> => {
+    // Simular dados históricos (em produção, buscar da API)
+    const days = 252; // 1 ano de dados
+    const prices: number[][] = [];
+    
+    for (let day = 0; day < days; day++) {
+      const row: number[] = [];
+      for (const ticker of tickers) {
+        // Simular preço com random walk
+        const basePrice = 100;
+        const randomChange = (Math.random() - 0.5) * 0.02;
+        const price = basePrice * Math.pow(1 + randomChange, day);
+        row.push(price);
+      }
+      prices.push(row);
+    }
+    
+    return prices;
+  };
+
+  // Executar otimização
+  const runOptimization = async () => {
+    if (!portfolio || portfolio.assets.length < 2) {
+      toast.error("Portfólio precisa ter pelo menos 2 ativos");
+      return;
+    }
+
     setOptimizing(true);
     setOptimizationProgress(0);
     setError(null);
@@ -46,7 +401,7 @@ const PortfolioOptimization = () => {
     let progressInterval: NodeJS.Timeout | null = null;
 
     try {
-      // Iniciar polling de progresso
+      // Polling de progresso
       const startProgressPolling = () => {
         progressInterval = setInterval(async () => {
           try {
@@ -54,11 +409,9 @@ const PortfolioOptimization = () => {
             if (progressRes.ok) {
               const progressData = await progressRes.json();
               setOptimizationProgress(progressData.progress || 0);
-
               if (progressData.status === "error") {
                 throw new Error(progressData.message || "Erro na otimização");
               }
-
               if (progressData.status === "completed") {
                 if (progressInterval) clearInterval(progressInterval);
               }
@@ -66,22 +419,22 @@ const PortfolioOptimization = () => {
           } catch (err) {
             console.error("Erro ao buscar progresso:", err);
           }
-        }, 500); // Polling a cada 500ms
+        }, 500);
       };
 
       startProgressPolling();
 
-      // Iniciar otimização
+      // Iniciar otimização no backend
       const optRes = await fetch(`${API_BASE}/otimizar`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          portfolio_id: portfolioId,
+          portfolio_id: Number(id),
           populacao: 100,
           geracoes: 50,
           risco_peso: 1.0,
           cvar_alpha: 0.95,
-          job_id: jobId
+          job_id: jobId,
         }),
       });
 
@@ -93,13 +446,12 @@ const PortfolioOptimization = () => {
       }
 
       const optData = await optRes.json();
-      console.log("Dados recebidos do backend:", optData);
       setOptimizationProgress(100);
 
-      // O backend retorna diretamente um OptimizationResultOut
-      const optimizedResult = {
-        originalReturn: Number(optData.originalReturn ?? currentPortfolio.totalReturn ?? 0),
-        originalRisk: Number(optData.originalRisk ?? currentPortfolio.totalRisk ?? 0),
+      // Processar resultado do backend
+      const optimizedResult: OptimizationResult = {
+        originalReturn: Number(optData.originalReturn ?? portfolio.totalReturn ?? 0),
+        originalRisk: Number(optData.originalRisk ?? portfolio.totalRisk ?? 0),
         optimizedReturn: Number(optData.optimizedReturn ?? 0),
         optimizedRisk: Number(optData.optimizedRisk ?? 0),
         improvement: Number(optData.improvement ?? 0),
@@ -107,72 +459,15 @@ const PortfolioOptimization = () => {
         optimizedWeights: Array.isArray(optData.optimizedWeights) ? optData.optimizedWeights : [],
       };
 
-      console.log("Resultado otimizado processado:", optimizedResult);
       setOptimized(optimizedResult);
+      setBacktestResults(optData.backtestResults || null);
+      setBacktestSeries(optData.backtestSeries || null);
+      setRiskContribution(optData.riskContribution || null);
+      setFronteiraTable(Array.isArray(optData.fronteiraTable) ? optData.fronteiraTable : []);
 
-      // Configurar histórico de convergência
-      if (optData.history && Array.isArray(optData.history)) {
-        setGaHistory(optData.history);
-      }
-
-      // Configurar séries temporais
-      if (optData.performanceSeries && Array.isArray(optData.performanceSeries)) {
-        setPerformanceData(optData.performanceSeries);
-      }
-      if (optData.originalPerformanceSeries && Array.isArray(optData.originalPerformanceSeries)) {
-        setOriginalPerformanceData(optData.originalPerformanceSeries);
-      }
-
-      // Configurar métricas quantitativas
-      if (optData.optimizedMetrics) {
-        setOptimizedMetrics(optData.optimizedMetrics);
-      }
-      if (optData.originalMetrics) {
-        setOriginalMetrics(optData.originalMetrics);
-      }
-
-      // Configurar alocação setorial
-      if (optData.sectorAllocation) {
-        console.log("Alocação setorial recebida:", optData.sectorAllocation);
-        setSectorAllocation(optData.sectorAllocation);
-      } else {
-        console.warn("Alocação setorial não recebida do backend");
-        // Tentar calcular a partir dos pesos otimizados
-        const calculatedAllocation: Record<string, number> = {};
-        if (optimizedResult.optimizedWeights && portfolio) {
-          optimizedResult.optimizedWeights.forEach((ow: any) => {
-            const asset = portfolio.assets.find(a => {
-              const assetTicker = a.ticker.replace(".SA", "").toUpperCase();
-              const optTicker = ow.ticker.replace(".SA", "").toUpperCase();
-              return assetTicker === optTicker;
-            });
-            if (asset && asset.sector) {
-              const sector = asset.sector || "Outros";
-              calculatedAllocation[sector] = (calculatedAllocation[sector] || 0) + Number(ow.weight || 0);
-            }
-          });
-          if (Object.keys(calculatedAllocation).length > 0) {
-            console.log("Alocação setorial calculada no frontend:", calculatedAllocation);
-            setSectorAllocation(calculatedAllocation);
-          }
-        }
-      }
-
-      // Configurar backtesting (performance real)
-      if (optData.backtestResults) {
-        console.log("Resultados de backtesting recebidos:", optData.backtestResults);
-        setBacktestResults(optData.backtestResults);
-      }
-      if (optData.backtestSeries) {
-        console.log("Série de backtesting recebida:", optData.backtestSeries);
-        setBacktestSeries(optData.backtestSeries);
-      }
-
-      // Configurar contribuição de risco
-      if (optData.riskContribution) {
-        console.log("Contribuição de risco recebida:", optData.riskContribution);
-        setRiskContribution(optData.riskContribution);
-      }
+      // Calcular fronteira eficiente localmente
+      setOptimizationProgress(50);
+      await calculateLocalOptimization(portfolio, optimizedResult);
 
       toast.success("Otimização concluída com sucesso!");
     } catch (err) {
@@ -182,46 +477,127 @@ const PortfolioOptimization = () => {
       if (progressInterval) clearInterval(progressInterval);
     } finally {
       setOptimizing(false);
-      // Limpar intervalo se ainda estiver rodando
-      if (progressInterval) {
-        clearInterval(progressInterval);
-      }
+      if (progressInterval) clearInterval(progressInterval);
     }
   };
 
-  // --- Função para aplicar otimização ---
+  // Calcular otimização local (fronteira eficiente)
+  const calculateLocalOptimization = async (
+    currentPortfolio: Portfolio,
+    optimizedResult: OptimizationResult
+  ) => {
+    try {
+      const tickers = currentPortfolio.assets.map(a => a.ticker);
+      
+      // Buscar preços históricos
+      const prices = await fetchHistoricalPrices(tickers);
+      if (prices.length === 0) return;
+
+      // Calcular retornos logarítmicos
+      const returns = calculateLogReturns(prices);
+      if (returns.length === 0) return;
+
+      // Calcular médias e covariância
+      const meanReturns: number[] = [];
+      for (let j = 0; j < tickers.length; j++) {
+        const assetReturns = returns.map(r => r[j]);
+        meanReturns.push(calculateAnnualizedMean(assetReturns));
+      }
+
+      const covMatrix = calculateCovarianceMatrix(returns);
+      if (covMatrix.length === 0) return;
+
+      // Calcular métricas do portfólio original
+      const originalWeights = currentPortfolio.assets.map(a => a.weight / 100);
+      const originalReturn = calculatePortfolioReturn(originalWeights, meanReturns);
+      const originalRisk = calculatePortfolioRisk(originalWeights, covMatrix);
+      const originalPortfolioReturns = returns.map(r =>
+        originalWeights.reduce((sum, w, i) => sum + w * r[i], 0)
+      );
+      const originalCvar = calculatePortfolioCVaR(originalPortfolioReturns);
+      const originalSharpe = calculateSharpeRatio(originalReturn, originalRisk);
+
+      // Calcular métricas do portfólio otimizado
+      const optimizedWeights = optimizedResult.optimizedWeights.map(ow => {
+        const asset = currentPortfolio.assets.find(a => 
+          a.ticker.replace(".SA", "").toUpperCase() === ow.ticker.replace(".SA", "").toUpperCase()
+        );
+        return asset ? ow.weight / 100 : 0;
+      });
+      
+      // Normalizar pesos
+      const sum = optimizedWeights.reduce((s, w) => s + w, 0);
+      const normalizedOptimizedWeights = sum > 0 ? optimizedWeights.map(w => w / sum) : optimizedWeights;
+      
+      const optimizedReturn = calculatePortfolioReturn(normalizedOptimizedWeights, meanReturns);
+      const optimizedRisk = calculatePortfolioRisk(normalizedOptimizedWeights, covMatrix);
+      const optimizedPortfolioReturns = returns.map(r =>
+        normalizedOptimizedWeights.reduce((sum, w, i) => sum + w * r[i], 0)
+      );
+      const optimizedCvar = calculatePortfolioCVaR(optimizedPortfolioReturns);
+      const optimizedSharpe = calculateSharpeRatio(optimizedReturn, optimizedRisk);
+
+      // Simular fronteira eficiente
+      setOptimizationProgress(70);
+      const efficientFrontier = simulateEfficientFrontier(meanReturns, covMatrix, 5000);
+      const bestSharpe = optimizeBySharpe(meanReturns, covMatrix, efficientFrontier);
+      const minRisk = findMinRisk(efficientFrontier);
+
+      // Simular fronteira com CVaR
+      setOptimizationProgress(85);
+      const cvarFrontier = simulateCvarFrontier(returns, meanReturns, covMatrix, 5000);
+      const bestCvarSharpe = optimizeBySharpe(meanReturns, covMatrix, cvarFrontier);
+
+      setOptimizationData({
+        original: {
+          return: originalReturn * 100,
+          risk: originalRisk * 100,
+          cvar: originalCvar,
+          sharpe: originalSharpe,
+        },
+        optimized: {
+          return: optimizedReturn * 100,
+          risk: optimizedRisk * 100,
+          cvar: optimizedCvar,
+          sharpe: optimizedSharpe,
+        },
+        efficientFrontier: efficientFrontier.slice(0, 1000), // Limitar para performance
+        bestSharpe,
+        minRisk,
+        cvarFrontier: cvarFrontier.slice(0, 1000),
+        bestCvarSharpe,
+      });
+
+      setOptimizationProgress(100);
+    } catch (err) {
+      console.error("Erro ao calcular otimização local:", err);
+    }
+  };
+
+  // Aplicar otimização
   const handleApplyOptimization = async () => {
     if (!optimized || !portfolio || !id) return;
     setApplySaving(true);
+    
     try {
-      console.log("Aplicando otimização. Pesos otimizados:", optimized.optimizedWeights);
-      console.log("Ativos do portfólio:", portfolio.assets);
-
       let updatedCount = 0;
       for (const ow of optimized.optimizedWeights) {
-        // Normalizar ticker para comparação (remover .SA se presente)
         const normalizedTicker = ow.ticker.replace(".SA", "").toUpperCase();
         const asset = portfolio.assets.find(a => {
           const assetTicker = a.ticker.replace(".SA", "").toUpperCase();
           return assetTicker === normalizedTicker;
         });
 
-        if (!asset) {
-          console.warn(`Ativo não encontrado no portfólio: ${ow.ticker}`);
-          continue;
-        }
-
-        console.log(`Atualizando ${ow.ticker} (ID: ${asset.id}) com peso ${ow.weight}%`);
+        if (!asset) continue;
 
         const res = await fetch(`${API_BASE}/portfolio/${id}/ativos/${asset.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ weight: Number(ow.weight) }), // peso já está em porcentagem (0-100)
+          body: JSON.stringify({ weight: Number(ow.weight) }),
         });
 
         if (!res.ok) {
           const errorText = await res.text();
-          console.error(`Erro ao atualizar ${ow.ticker}:`, errorText);
           throw new Error(`Falha ao atualizar ${ow.ticker}: ${errorText}`);
         }
 
@@ -229,83 +605,118 @@ const PortfolioOptimization = () => {
       }
 
       if (updatedCount === 0) {
-        throw new Error("Nenhum ativo foi atualizado. Verifique se os tickers correspondem.");
+        throw new Error("Nenhum ativo foi atualizado");
       }
 
-      setApplySaved(true);
-      setTimeout(() => setApplySaved(false), 3000);
       toast.success(`Distribuição otimizada aplicada! ${updatedCount} ativo(s) atualizado(s).`);
-
-      // Aguardar um pouco antes de recarregar para garantir que o backend processou
       await new Promise(resolve => setTimeout(resolve, 1000));
-
-      // Limpar estado de otimização para forçar recálculo
-      setOptimized(null);
-      setSectorAllocation({});
-      setOptimizedMetrics(null);
-      setOriginalMetrics(null);
-      setPerformanceData([]);
-      setOriginalPerformanceData([]);
-      setGaHistory([]);
-      setBacktestResults(null);
-      setBacktestSeries(null);
-      setRiskContribution(null);
-
-      // atualizar portfólio
       await loadPortfolio();
-
-      // Navegar de volta para os detalhes para ver as mudanças
-      setTimeout(() => {
-        navigate(`/portfolio/${id}`);
-      }, 500);
+      setTimeout(() => navigate(`/portfolio/${id}`), 500);
     } catch (err) {
       console.error("Erro ao aplicar otimização:", err);
-      setError(`Erro ao aplicar mudanças: ${err}`);
       toast.error(`Erro ao aplicar mudanças: ${err}`);
     } finally {
       setApplySaving(false);
     }
   };
 
-  // --- Carregar portfólio (sem otimização automática) ---
-  const loadPortfolio = async () => {
-    if (!id) return;
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await fetch(`${API_BASE}/portfolio/${id}`);
-      if (!res.ok) throw new Error("Portfólio não encontrado");
-      const data = await res.json();
-      const p: Portfolio = {
-        id: String(data.id),
-        name: data.name || "",
-        createdAt: data.createdAt ? new Date(data.createdAt) : new Date(),
-        assets: (data.assets || []).map((a: any) => ({
-          id: String(a.id || ""),
-          ticker: a.ticker || "",
-          sector: a.sector || "",
-          weight: Number(a.weight || 0),
-          expectedReturn: Number(a.expectedReturn ?? 0),
-          cvar: Number(a.cvar ?? 0),
-        })),
-        totalReturn: data.totalReturn ?? 0,
-        totalRisk: data.totalRisk ?? 0,
-      };
-      setPortfolio(p);
+  useEffect(() => {
+    loadPortfolio();
+  }, [id]);
 
-      // Não executar otimização automaticamente - usuário deve clicar no botão
-      // A otimização será executada apenas quando o usuário clicar em "Otimizar" ou "Reotimizar"
+  // Preparar dados para gráficos
+  const markowitzChartData = useMemo(() => {
+    if (!optimizationData) return [];
+    
+    const data = optimizationData.efficientFrontier.map(point => ({
+      risk: point.risk,
+      return: point.return,
+      sharpe: point.sharpe,
+      type: "Simulação",
+    }));
 
-    } catch (err) {
-      console.error("Erro ao carregar portfólio:", err);
-      setError(String(err));
-      toast.error(`Erro ao carregar portfólio: ${err}`);
-    } finally {
-      setLoading(false);
+    // Adicionar pontos especiais
+    if (optimizationData.bestSharpe) {
+      data.push({
+        risk: optimizationData.bestSharpe.risk,
+        return: optimizationData.bestSharpe.return,
+        sharpe: optimizationData.bestSharpe.sharpe,
+        type: "Melhor Sharpe",
+      });
     }
-  };
 
-  useEffect(() => { loadPortfolio(); }, [id]);
+    if (optimizationData.minRisk) {
+      data.push({
+        risk: optimizationData.minRisk.risk,
+        return: optimizationData.minRisk.return,
+        sharpe: optimizationData.minRisk.sharpe,
+        type: "Menor Risco",
+      });
+    }
+
+    // Portfólio original
+    data.push({
+      risk: optimizationData.original.risk,
+      return: optimizationData.original.return,
+      sharpe: optimizationData.original.sharpe,
+      type: "Original",
+    });
+
+    // Portfólio otimizado
+    data.push({
+      risk: optimizationData.optimized.risk,
+      return: optimizationData.optimized.return,
+      sharpe: optimizationData.optimized.sharpe,
+      type: "Otimizado",
+    });
+
+    return data;
+  }, [optimizationData]);
+
+  const cvarChartData = useMemo(() => {
+    if (!optimizationData) return [];
+    
+    const data = optimizationData.cvarFrontier.map(point => ({
+      risk: point.risk,
+      return: point.return,
+      sharpe: point.sharpe,
+      type: "Simulação CVaR",
+    }));
+
+    if (optimizationData.bestCvarSharpe) {
+      data.push({
+        risk: optimizationData.bestCvarSharpe.risk,
+        return: optimizationData.bestCvarSharpe.return,
+        sharpe: optimizationData.bestCvarSharpe.sharpe,
+        type: "Melhor Sharpe CVaR",
+      });
+    }
+
+    data.push({
+      risk: optimizationData.original.cvar,
+      return: optimizationData.original.return,
+      sharpe: optimizationData.original.sharpe,
+      type: "Original",
+    });
+
+    data.push({
+      risk: optimizationData.optimized.cvar,
+      return: optimizationData.optimized.return,
+      sharpe: optimizationData.optimized.sharpe,
+      type: "Otimizado",
+    });
+
+    return data;
+  }, [optimizationData]);
+
+  // Função para colorir pontos pelo Sharpe
+  const getSharpeColor = (sharpe: number): string => {
+    if (sharpe > 1.5) return "#10b981"; // Verde - Excelente
+    if (sharpe > 1.0) return "#059669"; // Verde claro - Bom
+    if (sharpe > 0.5) return "#facc15"; // Amarelo - Médio
+    if (sharpe > 0) return "#f97316"; // Laranja - Baixo
+    return "#ef4444"; // Vermelho - Negativo
+  };
 
   if (loading) {
     return (
@@ -337,120 +748,45 @@ const PortfolioOptimization = () => {
     );
   }
 
-  const totalWeight = portfolio.assets.reduce((sum, a) => sum + a.weight, 0);
-
-  // Preparar dados do gráfico de pizza
-  const pieData = optimized && optimized.optimizedWeights && optimized.optimizedWeights.length > 0
-    ? optimized.optimizedWeights
-      .filter(w => w && w.ticker && w.weight > 0)
-      .map((w, i) => ({
-        name: (w.ticker || "").replace(".SA", ""),
-        value: Number(w.weight || 0),
-        color: COLORS[i % COLORS.length]
-      }))
-    : portfolio.assets
-      .filter(a => a.weight > 0)
-      .map((a, i) => ({
-        name: a.ticker.replace(".SA", ""),
-        value: a.weight,
-        color: COLORS[i % COLORS.length]
-      }));
-
-  // Preparar dados da fronteira eficiente
-  const frontierData = optimized && optimized.optimizedReturn > 0 && optimized.optimizedRisk > 0
-    ? [
-      {
-        risk: Number(portfolio.totalRisk ?? 0),
-        return: Number(portfolio.totalReturn ?? 0),
-        type: "Original"
-      },
-      {
-        risk: Number(optimized.optimizedRisk ?? 0),
-        return: Number(optimized.optimizedReturn ?? 0),
-        type: "Otimizado"
-      },
-    ]
-    : [
-      {
-        risk: Number(portfolio.totalRisk ?? 0),
-        return: Number(portfolio.totalReturn ?? 0),
-        type: "Original"
-      },
-    ];
-
   return (
     <div className="min-h-screen gradient-subtle">
       <div className="container mx-auto px-4 py-8 max-w-7xl">
+        {/* Header */}
         <div className="flex items-center justify-between mb-8">
           <div className="flex items-center gap-3">
             <Button variant="ghost" onClick={() => navigate(`/portfolio/${id}`)}>
               <ArrowLeft className="w-4 h-4 mr-2" />Voltar
             </Button>
             <div>
-              <h1 className="text-3xl font-bold">Otimização por Algoritmo Genético</h1>
+              <h1 className="text-3xl font-bold">Otimização de Portfólio</h1>
               <p className="text-muted-foreground text-sm mt-1">{portfolio.name}</p>
             </div>
           </div>
-          {!optimizing && portfolio.assets.length >= 2 && !optimized && (
-            <Button
-              onClick={() => runOptimization(Number(id), portfolio)}
-              disabled={optimizing}
-            >
+          {!optimizing && portfolio.assets.length >= 2 && (
+            <Button onClick={runOptimization} disabled={optimizing}>
               <Zap className="w-4 h-4 mr-2" />
-              Otimizar Portfólio
-            </Button>
-          )}
-          {!optimizing && portfolio.assets.length >= 2 && optimized && (
-            <Button
-              onClick={() => runOptimization(Number(id), portfolio)}
-              disabled={optimizing}
-              variant="outline"
-            >
-              <Zap className="w-4 h-4 mr-2" />
-              Reotimizar
+              {optimized ? "Reotimizar" : "Otimizar Portfólio"}
             </Button>
           )}
         </div>
 
-        {/* Loading State durante otimização */}
+        {/* Loading State */}
         {optimizing && (
-          <Card className="p-6 mb-6 shadow-card animate-fade-in">
+          <Card className="p-6 mb-6 shadow-card">
             <div className="space-y-4">
               <div className="flex items-center gap-3">
                 <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
                 <div className="flex-1">
                   <h3 className="font-semibold mb-1">Otimizando portfólio...</h3>
                   <p className="text-sm text-muted-foreground">
-                    {optimizationProgress < 15 && "Carregando dados do portfólio..."}
-                    {optimizationProgress >= 15 && optimizationProgress < 40 && "Buscando dados históricos dos ativos..."}
-                    {optimizationProgress >= 40 && optimizationProgress < 50 && "Calculando métricas dos ativos..."}
-                    {optimizationProgress >= 50 && optimizationProgress < 90 && "Executando algoritmo genético..."}
-                    {optimizationProgress >= 90 && "Processando resultados..."}
+                    {optimizationProgress < 50 && "Executando algoritmo genético..."}
+                    {optimizationProgress >= 50 && optimizationProgress < 100 && "Calculando fronteira eficiente..."}
+                    {optimizationProgress >= 100 && "Concluído!"}
                     {" "}({optimizationProgress}%)
                   </p>
                 </div>
               </div>
               <Progress value={optimizationProgress} className="h-3" />
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs text-muted-foreground">
-                <div className={`p-2 rounded ${optimizationProgress >= 5 ? 'bg-primary/10' : 'bg-secondary'}`}>
-                  ✓ Carregando portfólio
-                </div>
-                <div className={`p-2 rounded ${optimizationProgress >= 15 ? 'bg-primary/10' : 'bg-secondary'}`}>
-                  {optimizationProgress >= 15 ? '✓' : '○'} Buscando preços históricos
-                </div>
-                <div className={`p-2 rounded ${optimizationProgress >= 40 ? 'bg-primary/10' : 'bg-secondary'}`}>
-                  {optimizationProgress >= 40 ? '✓' : '○'} Calculando métricas
-                </div>
-                <div className={`p-2 rounded ${optimizationProgress >= 50 ? 'bg-primary/10' : 'bg-secondary'}`}>
-                  {optimizationProgress >= 50 ? '✓' : '○'} Executando GA
-                </div>
-                <div className={`p-2 rounded ${optimizationProgress >= 90 ? 'bg-primary/10' : 'bg-secondary'}`}>
-                  {optimizationProgress >= 90 ? '✓' : '○'} Processando resultados
-                </div>
-                <div className={`p-2 rounded ${optimizationProgress >= 100 ? 'bg-success/20 text-success' : 'bg-secondary'}`}>
-                  {optimizationProgress >= 100 ? '✓' : '○'} Concluído
-                </div>
-              </div>
             </div>
           </Card>
         )}
@@ -462,12 +798,9 @@ const PortfolioOptimization = () => {
               <Zap className="w-16 h-16 text-primary mx-auto mb-4 opacity-50" />
               <h2 className="text-2xl font-bold mb-2">Otimização não executada</h2>
               <p className="text-muted-foreground mb-6">
-                Clique no botão "Otimizar Portfólio" acima para iniciar a otimização usando algoritmo genético.
+                Clique no botão "Otimizar Portfólio" acima para iniciar a otimização.
               </p>
-              <Button
-                onClick={() => runOptimization(Number(id), portfolio)}
-                size="lg"
-              >
+              <Button onClick={runOptimization} size="lg">
                 <Zap className="w-5 h-5 mr-2" />
                 Iniciar Otimização
               </Button>
@@ -483,42 +816,41 @@ const PortfolioOptimization = () => {
               <p className="text-muted-foreground mb-6">
                 É necessário ter pelo menos 2 ativos no portfólio para realizar a otimização.
               </p>
-              <Button
-                onClick={() => navigate(`/portfolio/${id}`)}
-                variant="outline"
-                size="lg"
-              >
+              <Button onClick={() => navigate(`/portfolio/${id}`)} variant="outline" size="lg">
                 Adicionar Ativos
               </Button>
             </div>
           </Card>
         )}
 
-        {/* Cards Comparativos */}
-        {optimized && !optimizing && (
+        {/* Sessão 1: Comparativo Original vs Otimizado */}
+        {optimized && optimizationData && !optimizing && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
             <Card className="p-6 shadow-card">
               <h3 className="font-semibold text-sm text-muted-foreground mb-2">Portfólio Original</h3>
               <div className="space-y-2">
                 <div className="flex justify-between items-center">
-                  <span className="text-sm">Retorno Esperado</span>
-                  <span className="font-bold text-lg text-foreground">
-                    {optimized.originalReturn.toFixed(2)}%
+                  <span className="text-sm">Retorno Anualizado</span>
+                  <span className="font-bold text-lg">
+                    {optimizationData.original.return.toFixed(2)}%
                   </span>
                 </div>
                 <div className="flex justify-between items-center">
-                  <span className="text-sm">Risco (CVaR)</span>
-                  <span className="font-bold text-lg text-foreground">
-                    {optimized.originalRisk.toFixed(2)}%
+                  <span className="text-sm">Risco (Desvio Padrão)</span>
+                  <span className="font-bold text-lg">
+                    {optimizationData.original.risk.toFixed(2)}%
+                  </span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-sm">CVaR (95%)</span>
+                  <span className="font-bold text-lg">
+                    {optimizationData.original.cvar.toFixed(2)}%
                   </span>
                 </div>
                 <div className="flex justify-between items-center pt-2 border-t">
                   <span className="text-sm font-semibold">Sharpe Ratio</span>
                   <span className="font-bold text-lg">
-                    {optimized.originalReturn > 0
-                      ? (optimized.originalReturn / (optimized.originalRisk || 1)).toFixed(2)
-                      : "0.00"
-                    }
+                    {optimizationData.original.sharpe.toFixed(2)}
                   </span>
                 </div>
               </div>
@@ -535,19 +867,28 @@ const PortfolioOptimization = () => {
               </div>
               <div className="space-y-2">
                 <div className="flex justify-between items-center">
-                  <span className="text-sm">Retorno Esperado</span>
+                  <span className="text-sm">Retorno Anualizado</span>
                   <span className="font-bold text-lg text-success">
-                    {optimized.optimizedReturn.toFixed(2)}%
-                    {optimized.optimizedReturn > optimized.originalReturn && (
+                    {optimizationData.optimized.return.toFixed(2)}%
+                    {optimizationData.optimized.return > optimizationData.original.return && (
                       <ArrowUpRight className="w-4 h-4 inline ml-1" />
                     )}
                   </span>
                 </div>
                 <div className="flex justify-between items-center">
-                  <span className="text-sm">Risco (CVaR)</span>
-                  <span className="font-bold text-lg text-foreground">
-                    {optimized.optimizedRisk.toFixed(2)}%
-                    {optimized.optimizedRisk < optimized.originalRisk && (
+                  <span className="text-sm">Risco (Desvio Padrão)</span>
+                  <span className="font-bold text-lg">
+                    {optimizationData.optimized.risk.toFixed(2)}%
+                    {optimizationData.optimized.risk < optimizationData.original.risk && (
+                      <ArrowDownRight className="w-4 h-4 inline ml-1 text-success" />
+                    )}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-sm">CVaR (95%)</span>
+                  <span className="font-bold text-lg">
+                    {optimizationData.optimized.cvar.toFixed(2)}%
+                    {optimizationData.optimized.cvar < optimizationData.original.cvar && (
                       <ArrowDownRight className="w-4 h-4 inline ml-1 text-success" />
                     )}
                   </span>
@@ -555,15 +896,491 @@ const PortfolioOptimization = () => {
                 <div className="flex justify-between items-center pt-2 border-t">
                   <span className="text-sm font-semibold">Sharpe Ratio</span>
                   <span className="font-bold text-lg text-success">
-                    {optimized.optimizedReturn > 0
-                      ? (optimized.optimizedReturn / (optimized.optimizedRisk || 1)).toFixed(2)
-                      : "0.00"
-                    }
+                    {optimizationData.optimized.sharpe.toFixed(2)}
+                    {optimizationData.optimized.sharpe > optimizationData.original.sharpe && (
+                      <ArrowUpRight className="w-4 h-4 inline ml-1" />
+                    )}
                   </span>
                 </div>
               </div>
             </Card>
           </div>
+        )}
+
+        {/* Sessão 2: Gráfico Fronteira Eficiente Markowitz */}
+        {optimizationData && markowitzChartData.length > 0 && !optimizing && (
+          <Card className="p-6 mb-6 shadow-card">
+            <div className="mb-4">
+              <h2 className="font-semibold mb-1 flex items-center gap-2">
+                <Target className="w-5 h-5" />
+                Fronteira Eficiente de Markowitz
+              </h2>
+              <p className="text-sm text-muted-foreground">
+                Simulação de {optimizationData.efficientFrontier.length} portfólios. 
+                Pontos coloridos pelo Sharpe Ratio.
+              </p>
+            </div>
+            <ResponsiveContainer width="100%" height={500}>
+              <ScatterChart margin={{ top: 20, right: 20, bottom: 60, left: 60 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
+                <XAxis
+                  type="number"
+                  dataKey="risk"
+                  name="Risco (%)"
+                  label={{ value: "Risco (Desvio Padrão) %", position: "insideBottom", offset: -5 }}
+                  stroke="hsl(var(--muted-foreground))"
+                />
+                <YAxis
+                  type="number"
+                  dataKey="return"
+                  name="Retorno (%)"
+                  label={{ value: "Retorno Esperado %", angle: -90, position: "insideLeft" }}
+                  stroke="hsl(var(--muted-foreground))"
+                />
+                <Tooltip
+                  contentStyle={{
+                    backgroundColor: "hsl(var(--card))",
+                    border: "1px solid hsl(var(--border))",
+                    borderRadius: "8px",
+                  }}
+                  formatter={(val: any, name: string, props: any) => {
+                    if (name === "return") return [`${Number(val).toFixed(2)}%`, "Retorno"];
+                    if (name === "risk") return [`${Number(val).toFixed(2)}%`, "Risco"];
+                    return [val, name];
+                  }}
+                  labelFormatter={(label, payload) => {
+                    if (payload && payload[0]) {
+                      const data = payload[0].payload;
+                      return `${data.type || "Ponto"} - Sharpe: ${data.sharpe?.toFixed(2) || "N/A"}`;
+                    }
+                    return label;
+                  }}
+                />
+                <Legend />
+                <Scatter
+                  name="Simulações"
+                  data={markowitzChartData.filter(d => d.type === "Simulação")}
+                  fill="#8884d8"
+                  shape="circle"
+                >
+                  {markowitzChartData
+                    .filter(d => d.type === "Simulação")
+                    .map((entry, index) => (
+                      <Cell key={`cell-${index}`} fill={getSharpeColor(entry.sharpe)} />
+                    ))}
+                </Scatter>
+                <Scatter
+                  name="Melhor Sharpe"
+                  data={markowitzChartData.filter(d => d.type === "Melhor Sharpe")}
+                  fill="#10b981"
+                  shape="star"
+                />
+                <Scatter
+                  name="Menor Risco"
+                  data={markowitzChartData.filter(d => d.type === "Menor Risco")}
+                  fill="#3b82f6"
+                  shape="triangle"
+                />
+                <Scatter
+                  name="Portfólio Original"
+                  data={markowitzChartData.filter(d => d.type === "Original")}
+                  fill="#6b7280"
+                  shape="square"
+                />
+                <Scatter
+                  name="Portfólio Otimizado"
+                  data={markowitzChartData.filter(d => d.type === "Otimizado")}
+                  fill="#ef4444"
+                  shape="diamond"
+                />
+              </ScatterChart>
+            </ResponsiveContainer>
+            <div className="mt-4 p-3 bg-secondary rounded-lg">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                <div className="flex items-center gap-2">
+                  <div className="w-3 h-3 rounded-full bg-success"></div>
+                  <span>Melhor Sharpe</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="w-3 h-3 rounded-full bg-blue-500"></div>
+                  <span>Menor Risco</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="w-3 h-3 rounded-full bg-gray-500"></div>
+                  <span>Original</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="w-3 h-3 rounded-full bg-red-500"></div>
+                  <span>Otimizado</span>
+                </div>
+              </div>
+            </div>
+          </Card>
+        )}
+
+        {/* Sessão 3: Gráfico Otimização CVaR */}
+        {optimizationData && cvarChartData.length > 0 && !optimizing && (
+          <Card className="p-6 mb-6 shadow-card">
+            <div className="mb-4">
+              <h2 className="font-semibold mb-1 flex items-center gap-2">
+                <Star className="w-5 h-5" />
+                Otimização usando CVaR
+              </h2>
+              <p className="text-sm text-muted-foreground">
+                Fronteira eficiente considerando Conditional Value at Risk (CVaR).
+              </p>
+            </div>
+            <ResponsiveContainer width="100%" height={500}>
+              <ScatterChart margin={{ top: 20, right: 20, bottom: 60, left: 60 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
+                <XAxis
+                  type="number"
+                  dataKey="risk"
+                  name="CVaR (%)"
+                  label={{ value: "CVaR (95%) %", position: "insideBottom", offset: -5 }}
+                  stroke="hsl(var(--muted-foreground))"
+                />
+                <YAxis
+                  type="number"
+                  dataKey="return"
+                  name="Retorno (%)"
+                  label={{ value: "Retorno Esperado %", angle: -90, position: "insideLeft" }}
+                  stroke="hsl(var(--muted-foreground))"
+                />
+                <Tooltip
+                  contentStyle={{
+                    backgroundColor: "hsl(var(--card))",
+                    border: "1px solid hsl(var(--border))",
+                    borderRadius: "8px",
+                  }}
+                  formatter={(val: any, name: string) => {
+                    if (name === "return") return [`${Number(val).toFixed(2)}%`, "Retorno"];
+                    if (name === "risk") return [`${Number(val).toFixed(2)}%`, "CVaR"];
+                    return [val, name];
+                  }}
+                  labelFormatter={(label, payload) => {
+                    if (payload && payload[0]) {
+                      const data = payload[0].payload;
+                      return `${data.type || "Ponto"} - Sharpe: ${data.sharpe?.toFixed(2) || "N/A"}`;
+                    }
+                    return label;
+                  }}
+                />
+                <Legend />
+                <Scatter
+                  name="Simulações CVaR"
+                  data={cvarChartData.filter(d => d.type === "Simulação CVaR")}
+                  fill="#8884d8"
+                  shape="circle"
+                >
+                  {cvarChartData
+                    .filter(d => d.type === "Simulação CVaR")
+                    .map((entry, index) => (
+                      <Cell key={`cell-cvar-${index}`} fill={getSharpeColor(entry.sharpe)} />
+                    ))}
+                </Scatter>
+                <Scatter
+                  name="Melhor Sharpe CVaR"
+                  data={cvarChartData.filter(d => d.type === "Melhor Sharpe CVaR")}
+                  fill="#10b981"
+                  shape="star"
+                />
+                <Scatter
+                  name="Portfólio Original"
+                  data={cvarChartData.filter(d => d.type === "Original")}
+                  fill="#6b7280"
+                  shape="square"
+                />
+                <Scatter
+                  name="Portfólio Otimizado"
+                  data={cvarChartData.filter(d => d.type === "Otimizado")}
+                  fill="#ef4444"
+                  shape="diamond"
+                />
+              </ScatterChart>
+            </ResponsiveContainer>
+          </Card>
+        )}
+
+        {/* Backtesting */}
+        {optimized && !optimizing && backtestResults && (
+          <BacktestComparisonCard 
+            backtestResults={backtestResults} 
+            backtestSeries={backtestSeries} 
+          />
+        )}
+
+        {/* Contribuição de Risco */}
+        {optimized && !optimizing && riskContribution && (
+          <OptimizationRiskContribution riskContribution={riskContribution} />
+        )}
+
+        {/* Tabela de Resultados do Algoritmo Genético */}
+        {optimized && !optimizing && fronteiraTable.length > 0 && (
+          <Card className="p-6 mb-6 shadow-card">
+            <div className="mb-4">
+              <h2 className="text-xl font-semibold mb-2 flex items-center gap-2">
+                <BarChart3 className="w-5 h-5" />
+                Resultados do Algoritmo Genético - Fronteira de Pareto
+              </h2>
+              <p className="text-sm text-muted-foreground">
+                Mostrando as {fronteiraTable.length} melhores soluções encontradas pelo algoritmo genético.
+                Cada linha representa uma solução não-dominada da fronteira de Pareto.
+              </p>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse">
+                <thead>
+                  <tr className="border-b border-border bg-secondary/50">
+                    <th className="text-left py-3 px-4 font-semibold text-sm">#</th>
+                    <th className="text-right py-3 px-4 font-semibold text-sm">Retorno (%)</th>
+                    <th className="text-right py-3 px-4 font-semibold text-sm">Risco (%)</th>
+                    <th className="text-right py-3 px-4 font-semibold text-sm">CVaR</th>
+                    <th className="text-right py-3 px-4 font-semibold text-sm">Sharpe</th>
+                    <th className="text-right py-3 px-4 font-semibold text-sm">Fitness</th>
+                    {portfolio?.assets.map((asset) => (
+                      <th key={asset.id} className="text-right py-3 px-4 font-semibold text-sm">
+                        {asset.ticker.replace(".SA", "")} (%)
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {fronteiraTable.map((sol: any, idx: number) => {
+                    const isValidRet = sol?.retorno != null && isFinite(sol.retorno) && sol.retorno >= -100 && sol.retorno <= 500;
+                    const isValidRisk = sol?.risco != null && isFinite(sol.risco) && sol.risco >= 0 && sol.risco <= 200;
+                    const isValidCvar = sol?.cvar != null && isFinite(sol.cvar) && sol.cvar >= 0 && sol.cvar <= 200;
+                    const isValidSharpe = sol?.sharpe != null && isFinite(sol.sharpe);
+                    const isBest = idx === 0; // Primeira solução é a melhor
+                    
+                    return (
+                      <tr
+                        key={sol.id || idx}
+                        className={`border-b border-border hover:bg-secondary/30 transition-colors ${
+                          isBest ? "bg-primary/10 font-semibold" : ""
+                        }`}
+                      >
+                        <td className="py-3 px-4 align-middle">
+                          {isBest && <Star className="w-4 h-4 inline mr-1 text-primary" />}
+                          {sol.id || idx + 1}
+                        </td>
+                        <td className={`py-3 px-4 text-right align-middle ${
+                          isValidRet && sol.retorno >= 0 ? "text-success" : isValidRet ? "text-destructive" : "text-muted-foreground"
+                        }`}>
+                          {isValidRet ? `${sol.retorno.toFixed(2)}%` : "-"}
+                        </td>
+                        <td className="py-3 px-4 text-right align-middle">
+                          {isValidRisk ? `${sol.risco.toFixed(2)}%` : "-"}
+                        </td>
+                        <td className="py-3 px-4 text-right align-middle">
+                          {isValidCvar ? `${(sol.cvar * 100).toFixed(2)}%` : "-"}
+                        </td>
+                        <td className={`py-3 px-4 text-right align-middle ${
+                          isValidSharpe && sol.sharpe > 0 ? "text-success" : "text-foreground"
+                        }`}>
+                          {isValidSharpe ? sol.sharpe.toFixed(3) : "-"}
+                        </td>
+                        <td className="py-3 px-4 text-right align-middle">
+                          {sol?.fitness != null && isFinite(sol.fitness) 
+                            ? sol.fitness.toFixed(4) 
+                            : "-"}
+                        </td>
+                        {portfolio?.assets.map((asset) => {
+                          // Tentar diferentes formas de buscar o peso
+                          const weight = sol?.weights?.[asset.ticker] 
+                            ?? sol?.weights?.[asset.ticker.replace(".SA", "")]
+                            ?? sol?.weights?.[asset.ticker.toUpperCase()]
+                            ?? sol?.weights?.[asset.ticker.replace(".SA", "").toUpperCase()]
+                            ?? 0;
+                          const isValidWeight = weight != null && isFinite(weight) && weight >= 0 && weight <= 100;
+                          return (
+                            <td key={asset.id} className="py-3 px-4 text-right align-middle text-sm">
+                              {isValidWeight ? `${weight.toFixed(2)}%` : "0.00%"}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="mt-4 p-3 bg-secondary/50 rounded-lg">
+              <p className="text-xs text-muted-foreground">
+                <Star className="w-3 h-3 inline mr-1" />
+                <strong>Solução Selecionada:</strong> A primeira linha (marcada com ⭐) representa a melhor solução encontrada,
+                selecionada pela heurística de menor soma normalizada dos objetivos.
+              </p>
+            </div>
+          </Card>
+        )}
+
+        {/* Tabela de Comparação de Pesos */}
+        {optimized && !optimizing && optimized.optimizedWeights.length > 0 && portfolio && (
+          <Card className="p-6 mb-6 shadow-card">
+            <div className="mb-4">
+              <h2 className="text-xl font-semibold mb-2 flex items-center gap-2">
+                <BarChart3 className="w-5 h-5" />
+                Comparação de Distribuição de Pesos
+              </h2>
+              <p className="text-sm text-muted-foreground">
+                Comparação entre os pesos atuais do portfólio e os pesos sugeridos pelo algoritmo genético.
+              </p>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse">
+                <thead>
+                  <tr className="border-b border-border bg-secondary/50">
+                    <th className="text-left py-3 px-4 font-semibold text-sm">Ativo</th>
+                    <th className="text-right py-3 px-4 font-semibold text-sm">Peso Original (%)</th>
+                    <th className="text-right py-3 px-4 font-semibold text-sm">Peso Otimizado (%)</th>
+                    <th className="text-right py-3 px-4 font-semibold text-sm">Diferença (%)</th>
+                    <th className="text-center py-3 px-4 font-semibold text-sm">Variação</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {portfolio.assets.map((asset) => {
+                    // Encontrar peso otimizado para este ativo
+                    const optimizedWeight = optimized.optimizedWeights.find(
+                      (ow: any) => 
+                        ow.ticker?.replace(".SA", "").toUpperCase() === asset.ticker.replace(".SA", "").toUpperCase() ||
+                        ow.ticker === asset.ticker
+                    );
+                    
+                    const originalWeight = asset.weight || 0;
+                    const newWeight = optimizedWeight?.weight || 0;
+                    const difference = newWeight - originalWeight;
+                    const isValidDiff = difference != null && isFinite(difference);
+                    const isIncrease = difference > 0;
+                    const isDecrease = difference < 0;
+                    
+                    return (
+                      <tr
+                        key={asset.id}
+                        className="border-b border-border hover:bg-secondary/30 transition-colors"
+                      >
+                        <td className="py-3 px-4 align-middle">
+                          <div className="flex items-center gap-2">
+                            <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0">
+                              <span className="text-xs font-bold text-primary">
+                                {asset.ticker.replace(".SA", "").slice(0, 2)}
+                              </span>
+                            </div>
+                            <span className="font-medium">{asset.ticker.replace(".SA", "")}</span>
+                          </div>
+                        </td>
+                        <td className="py-3 px-4 text-right align-middle">
+                          <span className="font-semibold">
+                            {originalWeight != null && isFinite(originalWeight) 
+                              ? `${Math.max(0, Math.min(100, originalWeight)).toFixed(2)}%` 
+                              : "0.00%"}
+                          </span>
+                        </td>
+                        <td className="py-3 px-4 text-right align-middle">
+                          <span className={`font-semibold ${
+                            isIncrease ? "text-success" : isDecrease ? "text-primary" : "text-foreground"
+                          }`}>
+                            {newWeight != null && isFinite(newWeight) 
+                              ? `${Math.max(0, Math.min(100, newWeight)).toFixed(2)}%` 
+                              : "0.00%"}
+                          </span>
+                        </td>
+                        <td className={`py-3 px-4 text-right align-middle font-semibold ${
+                          isIncrease ? "text-success" : isDecrease ? "text-destructive" : "text-foreground"
+                        }`}>
+                          {isValidDiff ? (
+                            <>
+                              {isIncrease ? "+" : ""}
+                              {difference.toFixed(2)}%
+                            </>
+                          ) : (
+                            "0.00%"
+                          )}
+                        </td>
+                        <td className="py-3 px-4 text-center align-middle">
+                          {isValidDiff && Math.abs(difference) > 0.01 ? (
+                            <div className="flex items-center justify-center gap-1">
+                              {isIncrease ? (
+                                <>
+                                  <ArrowUpRight className="w-4 h-4 text-success" />
+                                  <span className="text-xs text-success font-semibold">Aumentar</span>
+                                </>
+                              ) : isDecrease ? (
+                                <>
+                                  <ArrowDownRight className="w-4 h-4 text-destructive" />
+                                  <span className="text-xs text-destructive font-semibold">Reduzir</span>
+                                </>
+                              ) : (
+                                <span className="text-xs text-muted-foreground">Sem mudança</span>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">Sem mudança</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+                <tfoot>
+                  <tr className="border-t-2 border-border bg-secondary/30 font-semibold">
+                    <td className="py-3 px-4 align-middle">Total</td>
+                    <td className="py-3 px-4 text-right align-middle">
+                      {portfolio.assets.reduce((sum, a) => sum + (a.weight || 0), 0).toFixed(2)}%
+                    </td>
+                    <td className="py-3 px-4 text-right align-middle">
+                      {optimized.optimizedWeights.reduce((sum: number, ow: any) => sum + (ow.weight || 0), 0).toFixed(2)}%
+                    </td>
+                    <td className="py-3 px-4 text-right align-middle">-</td>
+                    <td className="py-3 px-4 text-center align-middle">-</td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+
+            <div className="mt-4 p-3 bg-secondary/50 rounded-lg">
+              <p className="text-xs text-muted-foreground">
+                <strong>Legenda:</strong> Os pesos otimizados são calculados pelo algoritmo genético para maximizar 
+                o retorno esperado enquanto minimiza o risco (CVaR). A diferença mostra quanto cada ativo deve ser 
+                ajustado em relação à distribuição atual.
+              </p>
+            </div>
+          </Card>
+        )}
+
+        {/* Botão Aplicar Mudanças */}
+        {optimized && !optimizing && optimized.optimizedWeights.length > 0 && (
+          <Card className="p-6 mb-6 shadow-card">
+            <div className="text-center space-y-4">
+              <div>
+                <h3 className="font-semibold mb-2">Aplicar Distribuição Otimizada</h3>
+                <p className="text-sm text-muted-foreground mb-4">
+                  A distribuição otimizada será aplicada ao portfólio, atualizando os pesos dos ativos.
+                </p>
+              </div>
+              <Button
+                onClick={handleApplyOptimization}
+                disabled={applySaving}
+                size="lg"
+                className="min-w-[200px]"
+              >
+                {applySaving ? (
+                  <>
+                    <span className="animate-spin mr-2">⏳</span>
+                    Salvando...
+                  </>
+                ) : (
+                  <>
+                    <Zap className="w-4 h-4 mr-2" />
+                    Aplicar Mudanças
+                  </>
+                )}
+              </Button>
+            </div>
+          </Card>
         )}
 
         {/* Error Display */}
@@ -577,498 +1394,11 @@ const PortfolioOptimization = () => {
               className="mt-3"
               onClick={() => {
                 setError(null);
-                if (portfolio) runOptimization(Number(id), portfolio);
+                if (portfolio) runOptimization();
               }}
             >
               Tentar novamente
             </Button>
-          </Card>
-        )}
-
-        {/* Backtesting - Performance Real */}
-        {optimized && !optimizing && backtestResults && (
-          <BacktestComparisonCard 
-            backtestResults={backtestResults} 
-            backtestSeries={backtestSeries} 
-          />
-        )}
-
-        {/* Contribuição de Risco */}
-        {optimized && !optimizing && riskContribution && (
-          <OptimizationRiskContribution riskContribution={riskContribution} />
-        )}
-
-        {/* Gráfico de Evolução Temporal */}
-        {optimized && !optimizing && performanceData.length > 0 && (
-          <Card className="p-6 mb-6 shadow-card">
-            <h3 className="text-xl font-bold mb-4">Evolução Temporal - Retorno Acumulado</h3>
-            <p className="text-sm text-muted-foreground mb-4">
-              Comparação do desempenho do portfólio otimizado frente à carteira base, Ibovespa e Selic
-            </p>
-            <ResponsiveContainer width="100%" height={400}>
-              <LineChart>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis
-                  dataKey="date"
-                  tick={{ fontSize: 12 }}
-                  angle={-45}
-                  textAnchor="end"
-                  height={80}
-                />
-                <YAxis
-                  label={{ value: 'Retorno Acumulado (%)', angle: -90, position: 'insideLeft' }}
-                  tick={{ fontSize: 12 }}
-                />
-                <Tooltip
-                  formatter={(value: any) => `${Number(value).toFixed(2)}%`}
-                  labelFormatter={(label) => `Data: ${label}`}
-                />
-                <Legend />
-                <Line
-                  type="monotone"
-                  dataKey="portfolio"
-                  name="Portfólio Otimizado"
-                  stroke="#10b981"
-                  strokeWidth={2}
-                  dot={false}
-                  data={performanceData}
-                />
-                {originalPerformanceData.length > 0 && (
-                  <Line
-                    type="monotone"
-                    dataKey="portfolio"
-                    name="Carteira Base"
-                    stroke="#ef4444"
-                    strokeWidth={2}
-                    dot={false}
-                    data={originalPerformanceData}
-                  />
-                )}
-                <Line
-                  type="monotone"
-                  dataKey="ibovespa"
-                  name="Ibovespa"
-                  stroke="#3b82f6"
-                  strokeWidth={2}
-                  dot={false}
-                  data={performanceData}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="selic"
-                  name="Selic"
-                  stroke="#facc15"
-                  strokeWidth={2}
-                  dot={false}
-                  data={performanceData}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-          </Card>
-        )}
-
-        <div className="grid grid-cols-2 gap-4 mb-6">
-          {/* Gráfico de Alocação Setorial */}
-          {optimized && !optimizing && (
-            <Card className="p-6 mb-6 shadow-card">
-              <h3 className="text-xl font-bold mb-4">Alocação Setorial</h3>
-              <p className="text-sm text-muted-foreground mb-4">
-                Distribuição automática promovida pelo algoritmo genético entre setores
-              </p>
-              {Object.keys(sectorAllocation).length > 0 ? (
-                <ResponsiveContainer width="100%" height={400}>
-                  <PieChart>
-                    <Pie
-                      data={Object.entries(sectorAllocation)
-                        .map(([name, value]) => ({ name, value: Number(value) }))
-                        .filter(item => item.value > 0)
-                        .sort((a, b) => b.value - a.value)}
-                      cx="50%"
-                      cy="50%"
-                      labelLine={false}
-                      label={({ name, percent }) => `${name}: ${(percent * 100).toFixed(1)}%`}
-                      outerRadius={120}
-                      fill="#8884d8"
-                      dataKey="value"
-                    >
-                      {Object.entries(sectorAllocation)
-                        .filter(([_, value]) => Number(value) > 0)
-                        .map((_, index) => (
-                          <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
-                        ))}
-                    </Pie>
-                    <Tooltip formatter={(value: any) => `${Number(value).toFixed(2)}%`} />
-                    <Legend />
-                  </PieChart>
-                </ResponsiveContainer>
-              ) : (
-                <div className="text-center py-12 text-muted-foreground">
-                  <p>Alocação setorial não disponível</p>
-                  <p className="text-sm mt-2">Os setores serão calculados após a otimização</p>
-                </div>
-              )}
-            </Card>
-          )}
-          {/* Pie Chart Distribuição */}
-          {optimized && !optimizing && (
-            <Card className="p-6 mb-6 shadow-card">
-              <div className="mb-4">
-                <h2 className="font-semibold mb-1">Distribuição de Pesos Otimizada</h2>
-                <p className="text-sm text-muted-foreground">
-                  Nova alocação sugerida pelo algoritmo genético
-                </p>
-              </div>
-              <ResponsiveContainer width="100%" height={300}>
-                <PieChart>
-                  <Pie
-                    data={pieData}
-                    dataKey="value"
-                    cx="50%"
-                    cy="50%"
-                    outerRadius={100}
-                    label={({ name, value }) => `${name} ${value.toFixed(1)}%`}
-                    labelLine={false}
-                  >
-                    {pieData.map((entry, i) => <Cell key={i} fill={entry.color} />)}
-                  </Pie>
-                  <Tooltip
-                    contentStyle={{
-                      backgroundColor: "hsl(var(--card))",
-                      border: "1px solid hsl(var(--border))",
-                      borderRadius: "8px",
-                    }}
-                    formatter={(val: any) => `${Number(val).toFixed(2)}%`}
-                  />
-                  <Legend />
-                </PieChart>
-              </ResponsiveContainer>
-              <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-2">
-                {pieData.map((entry, i) => (
-                  <div key={i} className="flex items-center gap-2 text-sm">
-                    <div className="w-3 h-3 rounded-full" style={{ backgroundColor: entry.color }}></div>
-                    <span className="text-muted-foreground">{entry.name}:</span>
-                    <span className="font-semibold">{entry.value.toFixed(1)}%</span>
-                  </div>
-                ))}
-              </div>
-            </Card>
-          )}
-        </div>
-
-
-        {/* Indicadores Quantitativos */}
-        {optimized && !optimizing && optimizedMetrics && originalMetrics && (
-          <Card className="p-6 mb-6 shadow-card">
-            <h3 className="text-xl font-bold mb-4">Indicadores Quantitativos</h3>
-            <p className="text-sm text-muted-foreground mb-4">
-              Métricas comparativas entre portfólio original e otimizado
-            </p>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <div>
-                <h4 className="font-semibold mb-3 text-muted-foreground">Portfólio Original</h4>
-                <div className="space-y-3">
-                  <div className="flex justify-between items-center p-3 bg-muted/50 rounded-lg">
-                    <span className="text-sm">Retorno Médio</span>
-                    <span className="font-bold">{originalMetrics.retorno_medio?.toFixed(2) ?? "N/A"}%</span>
-                  </div>
-                  <div className="flex justify-between items-center p-3 bg-muted/50 rounded-lg">
-                    <span className="text-sm">CVaR</span>
-                    <span className="font-bold">{originalMetrics.cvar?.toFixed(2) ?? "N/A"}%</span>
-                  </div>
-                  <div className="flex justify-between items-center p-3 bg-muted/50 rounded-lg">
-                    <span className="text-sm">Volatilidade</span>
-                    <span className="font-bold">{originalMetrics.volatilidade?.toFixed(2) ?? "N/A"}%</span>
-                  </div>
-                  <div className="flex justify-between items-center p-3 bg-muted/50 rounded-lg">
-                    <span className="text-sm">Sharpe Ratio</span>
-                    <span className="font-bold">{originalMetrics.sharpe?.toFixed(2) ?? "N/A"}</span>
-                  </div>
-                  <div className="flex justify-between items-center p-3 bg-muted/50 rounded-lg">
-                    <span className="text-sm">Desvio Padrão</span>
-                    <span className="font-bold">{originalMetrics.desvio_padrao?.toFixed(2) ?? "N/A"}%</span>
-                  </div>
-                </div>
-              </div>
-              <div>
-                <h4 className="font-semibold mb-3 text-primary">Portfólio Otimizado</h4>
-                <div className="space-y-3">
-                  <div className="flex justify-between items-center p-3 bg-primary/10 rounded-lg">
-                    <span className="text-sm">Retorno Médio</span>
-                    <span className="font-bold text-primary">
-                      {optimizedMetrics.retorno_medio?.toFixed(2) ?? "N/A"}%
-                      {optimizedMetrics.retorno_medio > originalMetrics.retorno_medio && (
-                        <ArrowUpRight className="w-4 h-4 inline ml-1" />
-                      )}
-                    </span>
-                  </div>
-                  <div className="flex justify-between items-center p-3 bg-primary/10 rounded-lg">
-                    <span className="text-sm">CVaR</span>
-                    <span className="font-bold text-primary">
-                      {optimizedMetrics.cvar?.toFixed(2) ?? "N/A"}%
-                      {optimizedMetrics.cvar < originalMetrics.cvar && (
-                        <ArrowDownRight className="w-4 h-4 inline ml-1" />
-                      )}
-                    </span>
-                  </div>
-                  <div className="flex justify-between items-center p-3 bg-primary/10 rounded-lg">
-                    <span className="text-sm">Volatilidade</span>
-                    <span className="font-bold text-primary">
-                      {optimizedMetrics.volatilidade?.toFixed(2) ?? "N/A"}%
-                      {optimizedMetrics.volatilidade < originalMetrics.volatilidade && (
-                        <ArrowDownRight className="w-4 h-4 inline ml-1" />
-                      )}
-                    </span>
-                  </div>
-                  <div className="flex justify-between items-center p-3 bg-primary/10 rounded-lg">
-                    <span className="text-sm">Sharpe Ratio</span>
-                    <span className="font-bold text-primary">
-                      {optimizedMetrics.sharpe?.toFixed(2) ?? "N/A"}
-                      {optimizedMetrics.sharpe > originalMetrics.sharpe && (
-                        <ArrowUpRight className="w-4 h-4 inline ml-1" />
-                      )}
-                    </span>
-                  </div>
-                  <div className="flex justify-between items-center p-3 bg-primary/10 rounded-lg">
-                    <span className="text-sm">Desvio Padrão</span>
-                    <span className="font-bold text-primary">
-                      {optimizedMetrics.desvio_padrao?.toFixed(2) ?? "N/A"}%
-                      {optimizedMetrics.desvio_padrao < originalMetrics.desvio_padrao && (
-                        <ArrowDownRight className="w-4 h-4 inline ml-1" />
-                      )}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </Card>
-        )}
-
-        {/* Gráfico de Convergência GA */}
-        {gaHistory.length > 0 && (
-          <Card className="p-6 mb-6 shadow-card">
-            <div className="mb-4">
-              <h2 className="font-semibold mb-1">Convergência do Algoritmo Genético</h2>
-              <p className="text-sm text-muted-foreground">
-                Evolução do melhor indivíduo ao longo de {gaHistory.length} gerações
-              </p>
-            </div>
-            <ResponsiveContainer width="100%" height={350}>
-              <LineChart data={gaHistory} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                <XAxis
-                  dataKey="generation"
-                  label={{ value: "Geração", position: "insideBottom", offset: -5 }}
-                  stroke="hsl(var(--muted-foreground))"
-                />
-                <YAxis
-                  label={{ value: "Valor (%)", angle: -90, position: "insideLeft" }}
-                  stroke="hsl(var(--muted-foreground))"
-                />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: "hsl(var(--card))",
-                    border: "1px solid hsl(var(--border))",
-                    borderRadius: "8px",
-                  }}
-                  formatter={(val: any) => `${Number(val).toFixed(2)}%`}
-                />
-                <Legend />
-                <Line
-                  type="monotone"
-                  dataKey="ret"
-                  stroke="#10b981"
-                  strokeWidth={2}
-                  name="Retorno Esperado (%)"
-                  dot={false}
-                  activeDot={{ r: 6 }}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="cvar"
-                  stroke="#ef4444"
-                  strokeWidth={2}
-                  name="CVaR (%)"
-                  dot={false}
-                  activeDot={{ r: 6 }}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="fitness"
-                  stroke="#3b82f6"
-                  strokeWidth={2}
-                  strokeDasharray="5 5"
-                  name="Fitness"
-                  dot={false}
-                  activeDot={{ r: 6 }}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-            <div className="mt-4 p-3 bg-secondary rounded-lg">
-              <p className="text-xs text-muted-foreground">
-                <strong>Última geração:</strong> Retorno: {gaHistory[gaHistory.length - 1]?.ret.toFixed(2)}% |
-                CVaR: {gaHistory[gaHistory.length - 1]?.cvar.toFixed(2)}% |
-                Fitness: {gaHistory[gaHistory.length - 1]?.fitness.toFixed(2)}%
-              </p>
-            </div>
-          </Card>
-        )}
-
-        {/* Pie Chart Distribuição */}
-        {optimized && !optimizing && (
-          <Card className="p-6 mb-6 shadow-card">
-            <div className="mb-4">
-              <h2 className="font-semibold mb-1">Distribuição de Pesos Otimizada</h2>
-              <p className="text-sm text-muted-foreground">
-                Nova alocação sugerida pelo algoritmo genético
-              </p>
-            </div>
-            <ResponsiveContainer width="100%" height={300}>
-              <PieChart>
-                <Pie
-                  data={pieData}
-                  dataKey="value"
-                  cx="50%"
-                  cy="50%"
-                  outerRadius={100}
-                  label={({ name, value }) => `${name} ${value.toFixed(1)}%`}
-                  labelLine={false}
-                >
-                  {pieData.map((entry, i) => <Cell key={i} fill={entry.color} />)}
-                </Pie>
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: "hsl(var(--card))",
-                    border: "1px solid hsl(var(--border))",
-                    borderRadius: "8px",
-                  }}
-                  formatter={(val: any) => `${Number(val).toFixed(2)}%`}
-                />
-                <Legend />
-              </PieChart>
-            </ResponsiveContainer>
-            <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-2">
-              {pieData.map((entry, i) => (
-                <div key={i} className="flex items-center gap-2 text-sm">
-                  <div className="w-3 h-3 rounded-full" style={{ backgroundColor: entry.color }}></div>
-                  <span className="text-muted-foreground">{entry.name}:</span>
-                  <span className="font-semibold">{entry.value.toFixed(1)}%</span>
-                </div>
-              ))}
-            </div>
-          </Card>
-        )}
-
-        {/* Fronteira Eficiente */}
-        {optimized && !optimizing && frontierData.length > 0 && (
-          <Card className="p-6 mb-6 shadow-card">
-            <div className="mb-4">
-              <h2 className="font-semibold mb-1">Fronteira Eficiente</h2>
-              <p className="text-sm text-muted-foreground">
-                Comparação entre portfólio original e otimizado no espaço risco-retorno
-              </p>
-            </div>
-            <ResponsiveContainer width="100%" height={400}>
-              <ScatterChart margin={{ top: 20, right: 20, bottom: 20, left: 20 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                <XAxis
-                  type="number"
-                  dataKey="risk"
-                  name="Risco (CVaR)"
-                  label={{ value: "Risco (CVaR) %", position: "insideBottom", offset: -5 }}
-                  stroke="hsl(var(--muted-foreground))"
-                  domain={['auto', 'auto']}
-                />
-                <YAxis
-                  type="number"
-                  dataKey="return"
-                  name="Retorno"
-                  label={{ value: "Retorno Esperado %", angle: -90, position: "insideLeft" }}
-                  stroke="hsl(var(--muted-foreground))"
-                  domain={['auto', 'auto']}
-                />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: "hsl(var(--card))",
-                    border: "1px solid hsl(var(--border))",
-                    borderRadius: "8px",
-                  }}
-                  formatter={(val: any, name: string) => [`${Number(val).toFixed(2)}%`, name]}
-                />
-                <Legend />
-                <Scatter
-                  name="Portfólio Original"
-                  data={[frontierData[0]]}
-                  fill="#9ca3af"
-                  shape="circle"
-                />
-                {frontierData.length > 1 && (
-                  <Scatter
-                    name="Portfólio Otimizado"
-                    data={[frontierData[1]]}
-                    fill="#10b981"
-                    shape="star"
-                  />
-                )}
-              </ScatterChart>
-            </ResponsiveContainer>
-            {optimized && (
-              <div className="mt-4 p-3 bg-secondary rounded-lg">
-                <div className="grid grid-cols-2 gap-4 text-sm">
-                  <div>
-                    <p className="text-muted-foreground mb-1">Melhoria no Retorno</p>
-                    <p className="font-semibold text-lg text-success">
-                      +{optimized.improvement.toFixed(2)}%
-                    </p>
-                  </div>
-                  <div>
-                    <p className="text-muted-foreground mb-1">Redução no Risco</p>
-                    <p className="font-semibold text-lg text-success">
-                      {optimized.originalRisk > optimized.optimizedRisk
-                        ? `-${(optimized.originalRisk - optimized.optimizedRisk).toFixed(2)}%`
-                        : "0.00%"
-                      }
-                    </p>
-                  </div>
-                </div>
-              </div>
-            )}
-          </Card>
-        )}
-
-        {/* Botão Aplicar Mudanças */}
-        {optimized && !optimizing && optimized.optimizedWeights && optimized.optimizedWeights.length > 0 && (
-          <Card className="p-6 mb-6 shadow-card">
-            <div className="text-center space-y-4">
-              <div>
-                <h3 className="font-semibold mb-2">Aplicar Distribuição Otimizada</h3>
-                <p className="text-sm text-muted-foreground mb-4">
-                  A distribuição otimizada será aplicada ao portfólio, atualizando os pesos dos ativos.
-                </p>
-              </div>
-              <Button
-                onClick={handleApplyOptimization}
-                disabled={applySaving || applySaved}
-                size="lg"
-                className="min-w-[200px]"
-              >
-                {applySaving ? (
-                  <>
-                    <span className="animate-spin mr-2">⏳</span>
-                    Salvando...
-                  </>
-                ) : applySaved ? (
-                  <>
-                    <span className="mr-2">✅</span>
-                    Aplicado!
-                  </>
-                ) : (
-                  <>
-                    <Zap className="w-4 h-4 mr-2" />
-                    Aplicar Mudanças
-                  </>
-                )}
-              </Button>
-            </div>
           </Card>
         )}
       </div>

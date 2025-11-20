@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+sqlmodel
+pymysql  # Alternativa mais fácil ao mysqlclient no Windows. Para mysqlclient, veja INSTALL_MYSQLCLIENT.md
+yfinance
+pandas
+numpy
+apscheduler
+pydantic
+pydantic-settings
+python-multipart
+python-dateutil

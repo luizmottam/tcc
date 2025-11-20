@@ -4,6 +4,7 @@ export interface Asset {
   sector: string;
   weight: number;
   expectedReturn: number;
+  variance: number;
   cvar: number;
   currentPrice?: number;
 }
@@ -15,6 +16,7 @@ export interface Portfolio {
   assets: Asset[];
   totalReturn?: number;
   totalRisk?: number;
+  totalCvar?: number;
 }
 
 export interface OptimizationResult {

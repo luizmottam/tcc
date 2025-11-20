@@ -38,12 +38,22 @@ const Dashboard = () => {
           ticker: a.ticker,
           sector: a.sector || a.setor || "",
           weight: Number(a.weight ?? a.peso ?? 0),
-          expectedReturn: a.expectedReturn ?? 0,
-          cvar: a.cvar ?? 0,
-          currentPrice: a.currentPrice ?? undefined,
+          expectedReturn: (a?.expectedReturn != null && isFinite(a.expectedReturn)) 
+            ? Math.max(-100, Math.min(500, Number(a.expectedReturn))) 
+            : 0,
+          variance: (a?.variance != null && isFinite(a.variance)) 
+            ? Math.max(0, Math.min(200, Number(a.variance))) 
+            : 0,
+          cvar: (a?.cvar != null && isFinite(a.cvar)) 
+            ? Math.max(0, Math.min(200, Number(a.cvar))) 
+            : 0,
+          currentPrice: (a?.currentPrice != null && isFinite(a.currentPrice) && a.currentPrice > 0)
+            ? Number(a.currentPrice)
+            : undefined,
         })),
         totalReturn: p.totalReturn ?? 0,
         totalRisk: p.totalRisk ?? 0,
+        totalCvar: p.totalCvar ?? undefined,
       }));
 
       setPortfolios(mapped);
@@ -200,12 +210,20 @@ const Dashboard = () => {
   // Retorno médio e risco médio
   const averageReturn =
     portfolios.length > 0
-      ? portfolios.reduce((sum, p) => sum + (p.totalReturn ?? 0), 0) / portfolios.length
+      ? portfolios.reduce((sum, p) => {
+          const ret = p?.totalReturn ?? 0;
+          const validRet = (ret != null && isFinite(ret) && ret >= -100 && ret <= 500) ? ret : 0;
+          return sum + validRet;
+        }, 0) / portfolios.length
       : 0;
 
   const averageRisk =
     portfolios.length > 0
-      ? portfolios.reduce((sum, p) => sum + (p.totalRisk ?? 0), 0) / portfolios.length
+      ? portfolios.reduce((sum, p) => {
+          const risk = p?.totalRisk ?? 0;
+          const validRisk = (risk != null && isFinite(risk) && risk >= 0 && risk <= 200) ? risk : 0;
+          return sum + validRisk;
+        }, 0) / portfolios.length
       : 0;
 
   return (

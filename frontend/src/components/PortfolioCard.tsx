@@ -23,13 +23,20 @@ export const PortfolioCard = ({
   const portfolioName = portfolio.name|| "--";
   const createdAt = portfolio.createdAt ? new Date(portfolio.createdAt) : null;
 
-  // Retorno positivo/negativo
-  const isPositiveReturn = (portfolio.totalReturn ?? 0) >= 0;
-  const returnText = portfolio.totalReturn != null ? `${portfolio.totalReturn.toFixed(2)}%` : "--";
+  // Retorno positivo/negativo (com validação)
+  const totalReturn = portfolio?.totalReturn;
+  const isValidReturn = totalReturn != null && isFinite(totalReturn) && totalReturn >= -100 && totalReturn <= 500;
+  const safeReturn = isValidReturn ? totalReturn : 0;
+  const isPositiveReturn = safeReturn >= 0;
+  const returnText = isValidReturn ? `${safeReturn.toFixed(2)}%` : "--";
 
-  // CVaR alto / baixo
-  const cvar = portfolio.totalRisk ?? 0;
-  const cvarText = portfolio.totalRisk != null ? `${cvar.toFixed(2)}%` : "--";
+  // CVaR alto / baixo (usar totalCvar se disponível, senão totalRisk) - com validação
+  const totalCvar = portfolio?.totalCvar;
+  const totalRisk = portfolio?.totalRisk;
+  const cvarValue = totalCvar ?? totalRisk;
+  const isValidCvar = cvarValue != null && isFinite(cvarValue) && cvarValue >= 0 && cvarValue <= 200;
+  const cvar = isValidCvar ? cvarValue : 0;
+  const cvarText = isValidCvar ? `${cvar.toFixed(2)}%` : "--";
   const isCvarHigh = cvar > cvarThreshold;
 
   // Classes dinâmicas

@@ -18,6 +18,7 @@ import {
   Building2,
   Percent,
   ArrowUpRight,
+  ArrowDownRight,
   AlertTriangle,
   Pencil,
   Trash2,
@@ -55,12 +56,22 @@ const PortfolioDetails = () => {
             ticker: a.ticker || "",
             sector: a.sector || "",
             weight: Number(a.weight || 0),  // Já vem em percentual (0-100) do backend
-            expectedReturn: Number(a.expectedReturn ?? 0),
-            cvar: Number(a.cvar ?? 0),
-            currentPrice: a.currentPrice ?? undefined,
+            expectedReturn: (a?.expectedReturn != null && isFinite(a.expectedReturn)) 
+              ? Math.max(-100, Math.min(500, Number(a.expectedReturn))) 
+              : 0,
+            variance: (a?.variance != null && isFinite(a.variance)) 
+              ? Math.max(0, Math.min(200, Number(a.variance))) 
+              : 0,
+            cvar: (a?.cvar != null && isFinite(a.cvar)) 
+              ? Math.max(0, Math.min(200, Number(a.cvar))) 
+              : 0,
+            currentPrice: (a?.currentPrice != null && isFinite(a.currentPrice) && a.currentPrice > 0)
+              ? Number(a.currentPrice)
+              : undefined,
           })),
           totalReturn: data.totalReturn ?? 0,
           totalRisk: data.totalRisk ?? 0,
+          totalCvar: data.totalCvar ?? undefined,
         };
         setPortfolio(mapped);
       } catch (err) {
@@ -151,7 +162,13 @@ const PortfolioDetails = () => {
         const paRes = await fetch(`${API_BASE}/portfolio/ativos`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ portfolio_id: Number(id), ativo_id: Number(ativoId), weight: Number(assetData.weight) * 100 }),
+          body: JSON.stringify({ 
+            portfolio_id: Number(id), 
+            ativo_id: Number(ativoId), 
+            ticker: assetData.ticker,
+            sector: assetData.sector,
+            weight: Number(assetData.weight) * 100 
+          }),
         });
         if (!paRes.ok) throw new Error("Erro ao associar ativo ao portfólio");
 
@@ -367,7 +384,7 @@ const PortfolioDetails = () => {
                       </td>
                       <td className="py-3 px-4 text-right align-middle">
                         <span className="inline-flex items-center gap-1 font-semibold whitespace-nowrap">
-                          {asset.currentPrice ? (
+                          {asset?.currentPrice != null && isFinite(asset.currentPrice) && asset.currentPrice > 0 ? (
                             <>R$ {asset.currentPrice.toFixed(2)}</>
                           ) : (
                             <span className="text-muted-foreground text-sm">-</span>
@@ -377,19 +394,40 @@ const PortfolioDetails = () => {
                       <td className="py-3 px-4 text-right align-middle">
                         <span className="inline-flex items-center gap-1 font-semibold whitespace-nowrap">
                           <Percent className="w-3 h-3 flex-shrink-0" />
-                          {asset.weight.toFixed(2)}%
+                          {asset?.weight != null && isFinite(asset.weight) 
+                            ? `${Math.max(0, Math.min(100, asset.weight)).toFixed(2)}%` 
+                            : "0.00%"}
                         </span>
                       </td>
                       <td className="py-3 px-4 text-right align-middle">
-                        <span className="inline-flex items-center gap-1 text-success font-semibold whitespace-nowrap">
-                          <ArrowUpRight className="w-3 h-3 flex-shrink-0" />
-                          {asset.expectedReturn.toFixed(2)}%
+                        <span className="inline-flex items-center gap-1 font-semibold whitespace-nowrap">
+                          {(() => {
+                            const ret = asset?.expectedReturn ?? 0;
+                            const isValid = ret != null && isFinite(ret) && ret >= -100 && ret <= 500;
+                            const safeRet = isValid ? ret : 0;
+                            return (
+                              <>
+                                {safeRet >= 0 ? (
+                                  <ArrowUpRight className="w-3 h-3 flex-shrink-0 text-success" />
+                                ) : (
+                                  <ArrowDownRight className="w-3 h-3 flex-shrink-0 text-destructive" />
+                                )}
+                                <span className={safeRet >= 0 ? "text-success" : "text-destructive"}>
+                                  {isValid ? `${safeRet.toFixed(2)}%` : "-"}
+                                </span>
+                              </>
+                            );
+                          })()}
                         </span>
                       </td>
                       <td className="py-3 px-4 text-right align-middle">
                         <span className="inline-flex items-center gap-1 text-destructive font-semibold whitespace-nowrap">
                           <AlertTriangle className="w-3 h-3 flex-shrink-0" />
-                          {asset.cvar.toFixed(2)}%
+                          {(() => {
+                            const cvar = asset?.cvar ?? 0;
+                            const isValid = cvar != null && isFinite(cvar) && cvar >= 0 && cvar <= 200;
+                            return isValid ? `${cvar.toFixed(2)}%` : "-";
+                          })()}
                         </span>
                       </td>
                       <td className="py-3 px-4 text-center align-middle">

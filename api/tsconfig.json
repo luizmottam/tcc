@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "rootDir": "./app",
+    "outDir": "./dist",
+
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "target": "es2020",
+
+    "types": ["node"],
+
+    "sourceMap": true,
+
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+
+    
+  }
+}

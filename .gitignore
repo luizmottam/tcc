@@ -9,3 +9,10 @@ vendor/
 *.log
 .vscode/
 .DS_Store
+
+
+docs/
+
+# Documentos do TCC (fora do repositório)
+*.pdf
+*.docx

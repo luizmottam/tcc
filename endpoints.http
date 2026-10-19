@@ -1,0 +1,19 @@
+
+
+# Pega as informações da empresa
+GET /stock/{ticker}/info
+# Pega o preço mais recente
+GET /stock/{ticker}/price
+# Pega o histórico de preços 
+GET /stock/{ticker}/history
+# Range pode ser alterado para "1d","5d","1mo","3mo","6mo","1y","2y","5y","10y","ytd","max"
+GET /stock/{ticker}/history?range=10y
+# Range pode ser alterado para "1d","5d","1mo","3mo","6mo","1y","2y","5y","10y","ytd","max"
+GET /stock/{ticker}/history?range=10y&interval=1y
+# Universo padrão de ativos Buy and Hold
+GET /portfolio/universe
+# Otimiza (NSGA-II Média-CVaR + Markowitz) e faz backtest fora da amostra
+POST /portfolio/optimize
+Content-Type: application/json
+
+{ "trainStart": "2021-01-01", "trainEnd": "2024-12-31", "testEnd": "2025-12-31" }

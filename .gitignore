@@ -1,0 +1,18 @@
+.env# Ignorar arquivos de ambiente
+.env
+
+# Ignorar pastas de dependências
+node_modules/
+vendor/
+
+# Ignorar arquivos de log e IDE
+*.log
+.vscode/
+.DS_Store
+
+
+docs/
+
+# Documentos do TCC (fora do repositório)
+*.pdf
+*.docx
